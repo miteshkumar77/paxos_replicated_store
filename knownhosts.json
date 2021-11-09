@@ -1,0 +1,18 @@
+{
+    "hosts": {
+        "alpha": {
+            "tcp_start_port": 9000,
+            "tcp_end_port": 9002,
+            "udp_start_port": 15000,
+            "udp_end_port": 15002,
+            "ip_address": "10.102.1.2"
+        },
+        "beta": {
+            "tcp_start_port": 9003,
+            "tcp_end_port": 9005,
+            "udp_start_port": 15003,
+            "udp_end_port": 15005,
+            "ip_address": "10.102.1.3"
+        }
+    }
+}
