@@ -1,0 +1,23 @@
+- Acceptor/Learner run in the background
+- Proposer runs in the same execution as the UI
+
+- start_synod executes one prepare/promise propose/accept cycle and
+    then sets the next highest prepare number for that log slot
+
+- When submitting an order command:
+    - pick the next log slot index x
+    - start synod on every hole in the log (with null proposal value)
+    - after a timeout check if all log holes are filled:
+        - if not all filled, retry (up to 3 times)
+    - if there are still holes remaining, can't submit order
+    - if log slot x was filled in that time by another proposal, can't submit order
+    - if there isn't enough inventory, can't submit order
+    - start synod for the order command
+    - after a timeout check if log slot x was filled:
+        - if not filled, retry (up to 3 times)
+    - if log slot x was not filled, can't submit order, we can 
+    re-use this slot for another proposal if it isn't filled later
+
+- send messages to proposer on port 0
+- send messages to acceptor on port 1
+- send messages to learner on port 2
