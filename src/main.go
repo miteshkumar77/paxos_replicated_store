@@ -9,6 +9,7 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
+	"math/rand"
 	"net"
 	"os"
 	"sort"
@@ -20,7 +21,7 @@ import (
 
 const max_tries = 3
 
-const synod_timeout = time.Second
+const synod_timeout = 5 * time.Second
 
 const max_pkt_size = 65507
 
@@ -55,6 +56,9 @@ func make_listener(addr *net.UDPAddr) *net.UDPConn {
 }
 
 func send_msg_to_addr(msg *Message, addr *net.UDPAddr) {
+	// go func(msg Message, addr *net.UDPAddr) {
+	// n := rand.Intn(5)
+	// time.Sleep(time.Duration(n) * time.Second)
 	var b bytes.Buffer
 	enc := gob.NewEncoder(&b)
 	err := enc.Encode(msg)
@@ -70,6 +74,7 @@ func send_msg_to_addr(msg *Message, addr *net.UDPAddr) {
 		log.Fatalf("udp Write error: %v\n", err)
 	}
 	conn.Close()
+	// }(*msg, addr)
 }
 
 func recv_from_conn(conn *net.UDPConn) *Message {
@@ -137,24 +142,29 @@ type LogEvent struct {
 type Message struct {
 	LogIndex int    `json:"log_index"`
 	SenderID string `json:"sender_id"`
-	// Prepare | Promise | Accept | Accepted | Acknowledge
+	// Prepare | Promise | Accept | Accepted | Acknowledge | Nack
 	Contents interface{} `json:"contents"`
 }
 
+type NackMessage struct {
+	PrepareNumber  int `json:"prepare_number"`
+	ProposalNumber int `json:"proposal_number"`
+}
+
 type PrepareMessage struct {
-	PrepareNumber int `json:"prepare_number"`
+	ProposalNumber int `json:"proposal_number"`
 }
 
 type PromiseMessage struct {
-	IsNull        bool     `json:"is_null"`
-	PrepareNumber int      `json:"prepare_number"`
-	AcceptNum     int      `json:"accept_num"`
-	AcceptVal     LogEvent `json:"accept_val"`
+	IsNull         bool     `json:"is_null"`
+	ProposalNumber int      `json:"proposal_number"`
+	AcceptNum      int      `json:"accept_num"`
+	AcceptVal      LogEvent `json:"accept_val"`
 }
 
 type AcceptMessage struct {
-	AcceptNum int      `json:"accept_num"`
-	AcceptVal LogEvent `json:"accept_val"`
+	ProposalNumber int      `json:"accept_num"`
+	ProposalVal    LogEvent `json:"accept_val"`
 }
 
 type AcceptedMessage struct {
@@ -163,7 +173,7 @@ type AcceptedMessage struct {
 }
 
 type AcknowledgeMessage struct {
-	AcceptNum int `json:"accept_num"`
+	ProposalNumber int `json:"accept_num"`
 }
 
 type Proposer struct {
@@ -345,6 +355,8 @@ func (srv *Server) send_to_id(msg *Message, site_id string) {
 		addr = proposer_addr(srv.peers[site_id])
 	case AcknowledgeMessage:
 		addr = proposer_addr(srv.peers[site_id])
+	case NackMessage:
+		addr = proposer_addr(srv.peers[site_id])
 	default:
 		log.Fatalf("send_to_id: Invalid Message Format\n")
 	}
@@ -356,15 +368,15 @@ func (srv *Server) send_to_id(msg *Message, site_id string) {
 
 func (prop *Proposer) create_prepare_message() PrepareMessage {
 	return PrepareMessage{
-		PrepareNumber: prop.maxPropNum}
+		ProposalNumber: prop.maxPropNum}
 }
 
 func (acc *Acceptor) create_promise_message(PrepareNumber int) PromiseMessage {
 	return PromiseMessage{
-		IsNull:        acc.isNull,
-		PrepareNumber: PrepareNumber,
-		AcceptNum:     acc.acceptNum,
-		AcceptVal:     acc.acceptVal}
+		IsNull:         acc.isNull,
+		ProposalNumber: PrepareNumber,
+		AcceptNum:      acc.acceptNum,
+		AcceptVal:      acc.acceptVal}
 }
 
 func (acc *Acceptor) create_accepted_message() AcceptedMessage {
@@ -386,15 +398,23 @@ func (srv *Server) handle_prepare(LogIndex int, SenderID string,
 
 	acceptor := srv.px.acceptor_records[LogIndex]
 
-	if prepareMsg.PrepareNumber > acceptor.maxPrepare {
-		acceptor.maxPrepare = prepareMsg.PrepareNumber
+	if prepareMsg.ProposalNumber > acceptor.maxPrepare {
+		acceptor.maxPrepare = prepareMsg.ProposalNumber
 		srv.px.acceptor_records[LogIndex] = acceptor
 		promiseMessageWrap := &Message{
 			LogIndex: LogIndex,
 			SenderID: srv.site_id,
-			Contents: acceptor.create_promise_message(prepareMsg.PrepareNumber),
+			Contents: acceptor.create_promise_message(prepareMsg.ProposalNumber),
 		}
 		srv.send_to_id(promiseMessageWrap, SenderID)
+	} else {
+		nackMessageWrap := &Message{
+			LogIndex: LogIndex,
+			SenderID: SenderID,
+			Contents: NackMessage{
+				ProposalNumber: prepareMsg.ProposalNumber,
+				PrepareNumber:  acceptor.maxPrepare}}
+		srv.send_to_id(nackMessageWrap, SenderID)
 	}
 
 	srv.px.gmtx.Unlock()
@@ -405,11 +425,11 @@ func (srv *Server) handle_accept(LogIndex int, SenderID string,
 	acceptMsg AcceptMessage) {
 	srv.px.gmtx.Lock()
 	acceptor := srv.px.acceptor_records[LogIndex]
-	if acceptMsg.AcceptNum >= acceptor.maxPrepare {
+	if acceptMsg.ProposalNumber >= acceptor.maxPrepare {
 		acceptor.isNull = false
-		acceptor.maxPrepare = acceptMsg.AcceptNum
-		acceptor.acceptNum = acceptMsg.AcceptNum
-		acceptor.acceptVal = acceptMsg.AcceptVal
+		acceptor.maxPrepare = acceptMsg.ProposalNumber
+		acceptor.acceptNum = acceptMsg.ProposalNumber
+		acceptor.acceptVal = acceptMsg.ProposalVal
 		srv.px.acceptor_records[LogIndex] = acceptor
 		acceptedMessageWrap := &Message{
 			LogIndex: LogIndex,
@@ -418,9 +438,17 @@ func (srv *Server) handle_accept(LogIndex int, SenderID string,
 		acknowledgeMessageWrap := &Message{
 			LogIndex: LogIndex,
 			SenderID: srv.site_id,
-			Contents: AcknowledgeMessage{AcceptNum: acceptMsg.AcceptNum}}
+			Contents: AcknowledgeMessage{ProposalNumber: acceptMsg.ProposalNumber}}
 		srv.send_to_id(acknowledgeMessageWrap, SenderID)
 		srv.send_all(acceptedMessageWrap)
+	} else {
+		nackMessageWrap := &Message{
+			LogIndex: LogIndex,
+			SenderID: SenderID,
+			Contents: NackMessage{
+				ProposalNumber: acceptMsg.ProposalNumber,
+				PrepareNumber:  acceptor.maxPrepare}}
+		srv.send_to_id(nackMessageWrap, SenderID)
 	}
 	srv.px.gmtx.Unlock()
 }
@@ -573,11 +601,19 @@ func (srv *Server) synod_attempt(propVal *LogEvent, LogIndex int) {
 	}
 	proposer_record := srv.px.proposer_records[LogIndex]
 	srv.px.gmtx.Unlock()
+	nackMaxPrepare := 0
 
 	for tries := 0; tries < max_tries; tries += 1 {
 
 		srv.px.gmtx.Lock()
 		proposer_record.maxPropNum += len(srv.peers)
+		if proposer_record.maxPropNum < nackMaxPrepare {
+			proposer_record.maxPropNum = proposer_record.maxPropNum +
+				((nackMaxPrepare-proposer_record.maxPropNum+len(srv.peers)-1)/len(srv.peers))*len(srv.peers)
+			// maxPropNum = ceil((nackMaxPrepare - maxPropNum)/N) * N + maxPropNum
+		}
+
+		// proposer_record.maxPropNum: the proposal number for the current round
 		srv.px.proposer_records[LogIndex] = proposer_record
 
 		prepareWrap := &Message{
@@ -589,6 +625,8 @@ func (srv *Server) synod_attempt(propVal *LogEvent, LogIndex int) {
 		srv.send_all(prepareWrap)
 
 		numPromises := make(map[string]bool)
+		numNacks := make(map[string]bool)
+
 		var acceptorAccVal *LogEvent = nil
 		maxAcceptorAccNum := -1
 		timer := time.After(synod_timeout)
@@ -597,7 +635,7 @@ func (srv *Server) synod_attempt(propVal *LogEvent, LogIndex int) {
 			case msg := <-mlbx:
 				switch v := msg.Contents.(type) {
 				case PromiseMessage:
-					if v.PrepareNumber != proposer_record.maxPropNum {
+					if v.ProposalNumber != proposer_record.maxPropNum {
 						continue
 					}
 					numPromises[msg.SenderID] = true
@@ -608,6 +646,18 @@ func (srv *Server) synod_attempt(propVal *LogEvent, LogIndex int) {
 					if len(numPromises)*2 > len(srv.peers) {
 						goto afterPhase1
 					}
+				case NackMessage:
+					if v.ProposalNumber != proposer_record.maxPropNum {
+						continue
+					}
+					if v.PrepareNumber > nackMaxPrepare {
+						v.PrepareNumber = nackMaxPrepare
+					}
+					numNacks[msg.SenderID] = true
+					if len(numNacks)*2 > len(srv.peers) {
+						goto afterPhase1
+					}
+
 				default:
 					// skip non-promise messages
 				}
@@ -625,28 +675,44 @@ func (srv *Server) synod_attempt(propVal *LogEvent, LogIndex int) {
 				log.Fatal("synod_attempt: majority of acceptors with null acc val and null proposed val NOT ALLOWED")
 			}
 			acceptMsg = &AcceptMessage{
-				AcceptNum: proposer_record.maxPropNum,
-				AcceptVal: *propVal}
+				ProposalNumber: proposer_record.maxPropNum,
+				ProposalVal:    *propVal}
 		} else {
 			acceptMsg = &AcceptMessage{
-				AcceptNum: proposer_record.maxPropNum,
-				AcceptVal: *acceptorAccVal}
+				ProposalNumber: proposer_record.maxPropNum,
+				ProposalVal:    *acceptorAccVal}
 		}
 		acceptMsgWrap := &Message{
 			LogIndex: LogIndex,
 			SenderID: srv.site_id,
 			Contents: *acceptMsg}
+
+		for k := range numNacks {
+			delete(numNacks, k)
+		}
+
 		srv.send_all(acceptMsgWrap)
 		timer = time.After(synod_timeout)
 		numAcknowledges := make(map[string]bool)
+
 		for {
 			select {
 			case msg := <-mlbx:
 				switch v := msg.Contents.(type) {
 				case AcknowledgeMessage:
-					if v.AcceptNum == proposer_record.maxPropNum {
+					if v.ProposalNumber == proposer_record.maxPropNum {
 						numAcknowledges[msg.SenderID] = true
 						if len(numAcknowledges)*2 > len(srv.peers) {
+							goto afterPhase2
+						}
+					}
+				case NackMessage:
+					if v.ProposalNumber == proposer_record.maxPropNum {
+						numNacks[msg.SenderID] = true
+						if v.PrepareNumber > nackMaxPrepare {
+							nackMaxPrepare = v.PrepareNumber
+						}
+						if len(numNacks)*2 > len(srv.peers) {
 							goto afterPhase2
 						}
 					}
@@ -666,7 +732,7 @@ func (srv *Server) synod_attempt(propVal *LogEvent, LogIndex int) {
 	srv.px.mlbx_mtx.Lock()
 	delete(srv.px.proposer_mlbx, LogIndex)
 	srv.px.mlbx_mtx.Unlock()
-	<-time.After(synod_timeout)
+	<-time.After(2 * synod_timeout)
 }
 
 func on_unsuccessful_commit_attempt_str(ev *LogEvent) string {
@@ -681,13 +747,7 @@ func on_unsuccessful_commit_attempt_str(ev *LogEvent) string {
 	}
 }
 
-func (srv *Server) submit_proposal(propVal *LogEvent) {
-	fmt.Fprintf(os.Stderr, "Submitting proposal %s\n", propVal.logEventStr())
-	srv.px.gmtx.Lock()
-	LogIndex := srv.px.learner_records.highestLogIndex + 1
-	numHoles := LogIndex - srv.px.learner_records.logSize
-	srv.px.gmtx.Unlock()
-	fmt.Fprintf(os.Stderr, "Currently: %d holes\n", numHoles)
+func (srv *Server) fill_holes(LogIndex, numHoles int) {
 	if numHoles > 0 {
 		var wg sync.WaitGroup
 		wg.Add(numHoles)
@@ -701,8 +761,16 @@ func (srv *Server) submit_proposal(propVal *LogEvent) {
 			}
 		}
 		wg.Wait()
-		fmt.Fprintln(os.Stderr, "Done attempting to fill holes")
 	}
+}
+
+func (srv *Server) submit_proposal(propVal *LogEvent) {
+	srv.px.gmtx.Lock()
+	LogIndex := srv.px.learner_records.highestLogIndex + 1
+	numHoles := LogIndex - srv.px.learner_records.logSize
+	srv.px.gmtx.Unlock()
+
+	srv.fill_holes(LogIndex, numHoles)
 
 	srv.px.gmtx.Lock()
 	canApply := srv.can_apply_log_event(propVal)
@@ -717,6 +785,10 @@ func (srv *Server) submit_proposal(propVal *LogEvent) {
 	srv.px.gmtx.Lock()
 	mjr := srv.px.learner_records.getMajority(LogIndex)
 	if mjr == nil || mjr.logEventStr() != propVal.logEventStr() {
+		if mjr != nil {
+			fmt.Println(mjr.logEventStr())
+			fmt.Println(propVal.logEventStr())
+		}
 		fmt.Fprintln(os.Stdout, on_unsuccessful_commit_attempt_str(propVal))
 	}
 	srv.px.gmtx.Unlock()
@@ -887,9 +959,11 @@ func (srv *Server) run() {
 	go stdin_read_loop(srv.stdin_c, stdin_reader)
 	go srv.learner_loop()
 	go srv.acceptor_loop()
-	fmt.Printf("Proposer listening at: %s\n", p_addr.String())
-	fmt.Printf("Acceptor listening at: %s\n", a_addr.String())
-	fmt.Printf("Learner listening at: %s\n", l_addr.String())
+	/*
+		fmt.Printf("Proposer listening at: %s\n", p_addr.String())
+		fmt.Printf("Acceptor listening at: %s\n", a_addr.String())
+		fmt.Printf("Learner listening at: %s\n", l_addr.String())
+	*/
 	srv.proposer_loop()
 }
 
@@ -912,25 +986,28 @@ func (msg *Message) messageStr() string {
 	switch v := msg.Contents.(type) {
 	case PrepareMessage:
 		return fmt.Sprintf("prepare[%d](%d)",
-			msg.LogIndex, v.PrepareNumber)
+			msg.LogIndex, v.ProposalNumber)
 	case PromiseMessage:
 		if v.IsNull {
 			return fmt.Sprintf("promise[%d](null, null, prepare:%d)",
-				msg.LogIndex, v.PrepareNumber)
+				msg.LogIndex, v.ProposalNumber)
 		}
 		return fmt.Sprintf("promise[%d](%d, `%s`)",
 			msg.LogIndex, v.AcceptNum,
 			v.AcceptVal.logEventStr())
 	case AcceptMessage:
 		return fmt.Sprintf("accept[%d](%d, `%s`)",
-			msg.LogIndex, v.AcceptNum,
-			v.AcceptVal.logEventStr())
+			msg.LogIndex, v.ProposalNumber,
+			v.ProposalVal.logEventStr())
 	case AcceptedMessage:
 		return fmt.Sprintf("accepted[%d](%d, `%s`)",
 			msg.LogIndex, v.AcceptNum,
 			v.AcceptVal.logEventStr())
 	case AcknowledgeMessage:
-		return fmt.Sprintf("ack[%d](%d)", msg.LogIndex, v.AcceptNum)
+		return fmt.Sprintf("ack[%d](%d)", msg.LogIndex, v.ProposalNumber)
+	case NackMessage:
+		return fmt.Sprintf("nack[%d](prepare_number: %d, proposal_number: %d)",
+			msg.LogIndex, v.PrepareNumber, v.ProposalNumber)
 	default:
 		log.Fatal("messageStr: Invalid Message Format")
 		return ""
@@ -991,6 +1068,7 @@ func parse_int_list(line *string) []int {
 }
 
 func main() {
+	rand.Seed(time.Now().UnixNano())
 	args := os.Args
 
 	gob.Register(Message{})
@@ -999,6 +1077,7 @@ func main() {
 	gob.Register(AcceptMessage{})
 	gob.Register(AcceptedMessage{})
 	gob.Register(PromiseMessage{})
+	gob.Register(NackMessage{})
 	gob.Register(LogEvent{})
 
 	if len(args) != 2 {
