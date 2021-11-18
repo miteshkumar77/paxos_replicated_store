@@ -604,12 +604,8 @@ func (srv *Server) synod_attempt(propVal *LogEvent, LogIndex int) {
 		srv.px.gmtx.Lock()
 		proposer_record.maxPropNum += len(srv.peers)
 		if proposer_record.maxPropNum < nackMaxPrepare {
-			b1 := proposer_record.maxPropNum
-			b2 := nackMaxPrepare
 			proposer_record.maxPropNum = proposer_record.maxPropNum +
 				((nackMaxPrepare-proposer_record.maxPropNum+len(srv.peers)-1)/len(srv.peers))*len(srv.peers)
-			fmt.Printf("propNum: %d\n, nackMaxPrepare: %d\n, propNumAfter: %d\n",
-				b1, b2, proposer_record.maxPropNum)
 			// maxPropNum = ceil((nackMaxPrepare - maxPropNum)/N) * N + maxPropNum
 		}
 
