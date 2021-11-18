@@ -2,28 +2,108 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/gob"
 	"encoding/json"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
+	"math/rand"
 	"net"
 	"os"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
-// largest udp packet data size
-const max_pkt_size = 80000
+const max_tries = 3
+
+const synod_timeout = time.Millisecond * 200
+
+const max_pkt_size = 65507
+
+var bind_addr = net.UDPAddr{IP: net.ParseIP("0.0.0.0")}
+
+const channel_capacity = 10000
+
+func proposer_addr(node Node) *net.UDPAddr {
+	return &net.UDPAddr{
+		Port: node.UdpStartPort,
+		IP:   net.ParseIP(node.IpAddress)}
+}
+
+func acceptor_addr(node Node) *net.UDPAddr {
+	return &net.UDPAddr{
+		Port: node.UdpStartPort + 1,
+		IP:   net.ParseIP(node.IpAddress)}
+}
+
+func learner_addr(node Node) *net.UDPAddr {
+	return &net.UDPAddr{
+		Port: node.UdpStartPort + 2,
+		IP:   net.ParseIP(node.IpAddress)}
+}
+
+func make_listener(addr *net.UDPAddr) *net.UDPConn {
+	conn, err := net.ListenUDP("udp", addr)
+	if err != nil {
+		fmt.Printf("make_encoder: udp listen error: %v\n", err)
+	}
+	return conn
+}
+
+func send_msg_to_addr(msg *Message, addr *net.UDPAddr) {
+	// go func(msg Message, addr *net.UDPAddr) {
+	// n := rand.Intn(5)
+	// time.Sleep(time.Duration(n) * time.Second)
+	var b bytes.Buffer
+	enc := gob.NewEncoder(&b)
+	err := enc.Encode(msg)
+	if err != nil {
+		log.Fatalf("send_msg_to_addr: Marshal error: %v\n", err)
+	}
+	conn, err := net.Dial("udp", addr.String())
+	if err != nil {
+		log.Fatalf("udp Dial error: %v\n", err)
+	}
+	_, err = conn.Write(b.Bytes())
+	if err != nil {
+		log.Fatalf("udp Write error: %v\n", err)
+	}
+	conn.Close()
+	// }(*msg, addr)
+}
+
+func recv_from_conn(conn *net.UDPConn) *Message {
+	data := make([]byte, max_pkt_size)
+	_, _, err := conn.ReadFromUDP(data)
+	if err != nil {
+		log.Fatalf("recv_from_conn: Read error %v\n", err)
+	}
+	var m Message
+	r := bytes.NewReader(data)
+	dec := gob.NewDecoder(r)
+	err = dec.Decode(&m)
+	if err != nil {
+		log.Fatalf("recv_from_conn: Unmarshal error: %v\n", err)
+	}
+	fmt.Fprintf(os.Stderr, "received %s from %s\n",
+		m.messageStr(), m.SenderID)
+	return &m
+}
+
+func make_message_chan() chan Message {
+	return make(chan Message, channel_capacity)
+}
 
 var item_names = [4]string{
 	"surgical masks",
 	"hand sanitizer bottles",
 	"toilet paper rolls",
-	"reese’s peanut butter cups"}
+	"reeses peanut butter cups"}
 
 var original_amounts = [4]int{500, 100, 200, 200}
 
@@ -59,91 +139,32 @@ type LogEvent struct {
 	Proposer_id string     `json:"proposer_id"`
 }
 
-func (opcode *OpCodeType) opCodeStr() string {
-	switch *opcode {
-	case Order:
-		return "order"
-	case Cancel:
-		return "cancel"
-	default:
-		log.Fatal("opCodeStr: Invalid Opcode")
-		return ""
-	}
-}
-
-func (ev *LogEvent) logEventStr() string {
-	if ev == nil {
-		return ""
-	}
-	switch ev.OpCode {
-	case Order:
-		return fmt.Sprintf("order %s %s @ %s",
-			ev.Name, amountsStr(ev.Amounts), ev.Proposer_id)
-	case Cancel:
-		return fmt.Sprintf("cancel %s @ %s", ev.Name, ev.Proposer_id)
-	default:
-		log.Fatal("logEventStr: Invalid Opcode")
-		return ""
-	}
-}
-
-func (msg *Message) messageStr() string {
-	{
-		pM := msg.Contents.(PrepareMessage)
-		fmt.Println(pM.PrepareNumber)
-		if prepareMsg, ok := msg.Contents.(PrepareMessage); ok {
-			return fmt.Sprintf("prepare[%d](%d)",
-				msg.LogIndex, prepareMsg.PrepareNumber)
-		}
-	}
-
-	{
-		if promiseMsg, ok := msg.Contents.(PromiseMessage); ok {
-			return fmt.Sprintf("promise[%d](%d, `%s`)",
-				msg.LogIndex, promiseMsg.AcceptNum,
-				promiseMsg.AcceptVal.logEventStr())
-		}
-	}
-
-	{
-		if acceptMsg, ok := msg.Contents.(AcceptMessage); ok {
-			return fmt.Sprintf("accept[%d](%d, `%s`)",
-				msg.LogIndex, acceptMsg.AcceptNum,
-				acceptMsg.AcceptVal.logEventStr())
-		}
-	}
-
-	{
-		if acceptedMsg, ok := msg.Contents.(AcceptedMessage); ok {
-			return fmt.Sprintf("accepted[%d](%d, `%s`)",
-				msg.LogIndex, acceptedMsg.AcceptNum,
-				acceptedMsg.AcceptVal.logEventStr())
-		}
-	}
-
-	log.Fatal("messageStr: Invalid Message Format")
-	return ""
-}
-
 type Message struct {
 	LogIndex int    `json:"log_index"`
 	SenderID string `json:"sender_id"`
-	// Prepare | Promise | Accept | Accepted
+	// Prepare | Promise | Accept | Accepted | Acknowledge | Nack
 	Contents interface{} `json:"contents"`
 }
 
+type NackMessage struct {
+	PrepareNumber  int `json:"prepare_number"`
+	ProposalNumber int `json:"proposal_number"`
+}
+
 type PrepareMessage struct {
-	PrepareNumber int `json:"prepare_number"`
+	ProposalNumber int `json:"proposal_number"`
 }
 
 type PromiseMessage struct {
-	AcceptNum int      `json:"accept_num"`
-	AcceptVal LogEvent `json:"accept_val"`
+	IsNull         bool     `json:"is_null"`
+	ProposalNumber int      `json:"proposal_number"`
+	AcceptNum      int      `json:"accept_num"`
+	AcceptVal      LogEvent `json:"accept_val"`
 }
 
 type AcceptMessage struct {
-	AcceptNum int      `json:"accept_num"`
-	AcceptVal LogEvent `json:"accept_val"`
+	ProposalNumber int      `json:"accept_num"`
+	ProposalVal    LogEvent `json:"accept_val"`
 }
 
 type AcceptedMessage struct {
@@ -151,41 +172,131 @@ type AcceptedMessage struct {
 	AcceptVal LogEvent `json:"accept_val"`
 }
 
-// Server is instantiated and run by each node participating
-// in the wuu-bernstein algorithm. It encapsulates the
-// LogRecord, standard input listener, udp network listener,
-// and the UDP addressing information. Contains handlers
-// for all of the different UI components.
+type AcknowledgeMessage struct {
+	ProposalNumber int `json:"accept_num"`
+}
+
+type Proposer struct {
+	maxPropNum int
+}
+
+type Acceptor struct {
+	maxPrepare int
+	isNull     bool
+	acceptNum  int
+	acceptVal  LogEvent
+}
+
+type Learner struct {
+	log              map[int]map[string]LogEvent
+	committed        map[int]LogEvent
+	logSize          int
+	highestLogIndex  int
+	inventoryAmounts [4]int
+	numPeers         int
+}
+
+type Paxos struct {
+	proposer_records map[int]Proposer
+	acceptor_records map[int]Acceptor
+	learner_records  Learner
+	proposer_mlbx    map[int]chan Message
+	mlbx_mtx         sync.Mutex
+	gmtx             sync.Mutex
+}
+
 type Server struct {
-	site_id        string
-	peers          map[string]Node
-	peer_addrs     map[string]*net.UDPAddr
-	peer_encs      map[string]*gob.Encoder
-	stdin_c        chan string
-	netwk_c        chan Message
-	server_mu      sync.Mutex
-	proposer_chans map[int]chan Message
-	log            map[int]LogEvent
-	maxPropNums    map[int]int
-	maxLogIndex    int
-	site_ord       int
+	site_id       string
+	peers         map[string]Node
+	px            Paxos
+	proposer_chan chan Message
+	acceptor_chan chan Message
+	learner_chan  chan Message
+	stdin_c       chan string
+	site_ord      int
 }
 
-// amountsStr converts an array of 4 integers representing
-// the inventory to a comma delimited string.
-func amountsStr(amounts [4]int) string {
-	var amountsStrVec [4]string
-	for i := 0; i < 4; i++ {
-		amountsStrVec[i] = fmt.Sprint(amounts[i])
+func dflProposer(site_ord int) *Proposer {
+	return &Proposer{maxPropNum: site_ord}
+}
+
+func dflAcceptor() *Acceptor {
+	return &Acceptor{
+		maxPrepare: 0,
+		isNull:     true,
+		acceptNum:  -1,
+		acceptVal:  LogEvent{OpCode: Cancel, Name: "", Amounts: [4]int{-1. - 1. - 1. - 1}, Proposer_id: ""}}
+}
+
+func (l *Learner) getMajority(LogIndex int) *LogEvent {
+	log_slot, ok := l.log[LogIndex]
+	if !ok {
+		return nil
 	}
-	return strings.Join(amountsStrVec[:], ",")
+
+	if mjr, exists := l.committed[LogIndex]; exists {
+		return &mjr
+	}
+
+	var majority_ev *LogEvent = nil
+	majority_ev_str := ""
+	majority_freq := 0
+
+	for _, ev := range log_slot {
+		ev_str := ev.logEventStr()
+		if ev_str == majority_ev_str {
+			majority_freq++
+		} else {
+			majority_freq--
+			if majority_freq <= 0 {
+				majority_freq = 1
+				majority_ev = &ev
+				majority_ev_str = ev_str
+			}
+		}
+	}
+
+	ct := 0
+	for _, ev := range log_slot {
+		ev_str := ev.logEventStr()
+		if ev_str == majority_ev_str {
+			ct++
+		}
+	}
+	if ct*2 > l.numPeers {
+		l.committed[LogIndex] = *majority_ev
+		return majority_ev
+	} else {
+		return nil
+	}
 }
 
-// newServer creates a new Server object for a particular site_id.
-// If it finds a "stable_storage.json" file, it will load the
-// LogRecord contents from there, otherwise it will create
-// a blank LogRecord object.
-func newServer(site_id string, peers Map) *Server {
+func newLearner(numPeers int) *Learner {
+	return &Learner{
+		log:             make(map[int]map[string]LogEvent),
+		committed:       make(map[int]LogEvent),
+		logSize:         0,
+		highestLogIndex: -1,
+		inventoryAmounts: [4]int{original_amounts[0],
+			original_amounts[1],
+			original_amounts[2],
+			original_amounts[3]},
+		numPeers: numPeers}
+}
+
+func newPaxos(numPeers int) *Paxos {
+	return &Paxos{
+		proposer_records: make(map[int]Proposer),
+		acceptor_records: make(map[int]Acceptor),
+		proposer_mlbx:    make(map[int]chan Message),
+		learner_records:  *newLearner(numPeers),
+		gmtx:             sync.Mutex{}}
+}
+
+func newServer(own_site_id string, peers Map) *Server {
+	// newServer should also handle crash recovery
+	// in the future
+
 	site_ord := 0
 	site_id_arr := make([]string, 0)
 	for peer_site_id := range peers.Hosts {
@@ -197,168 +308,581 @@ func newServer(site_id string, peers Map) *Server {
 	})
 
 	for idx, peer_site_id := range site_id_arr {
-		if peer_site_id == site_id {
+		if peer_site_id == own_site_id {
 			site_ord = idx + 1
 			break
 		}
 	}
 
-	s := Server{site_id: site_id,
-		peers:          peers.Hosts,
-		peer_addrs:     make(map[string]*net.UDPAddr),
-		peer_encs:      make(map[string]*gob.Encoder),
-		stdin_c:        make(chan string),
-		netwk_c:        make(chan Message),
-		proposer_chans: make(map[int]chan Message),
-		maxPropNums:    make(map[int]int),
-		log:            make(map[int]LogEvent),
-		maxLogIndex:    -1,
-		site_ord:       site_ord}
+	s := Server{
+		site_id:       own_site_id,
+		peers:         peers.Hosts,
+		px:            *newPaxos(len(peers.Hosts)),
+		proposer_chan: make_message_chan(),
+		acceptor_chan: make_message_chan(),
+		learner_chan:  make_message_chan(),
+		stdin_c:       make(chan string),
+		site_ord:      site_ord}
 
-	for id, node := range s.peers {
-		site_addr := net.UDPAddr{
-			Port: node.UdpStartPort,
-			IP:   net.ParseIP(node.IpAddress)}
-
-		conn, err := net.Dial("udp", site_addr.String())
-		if err != nil {
-			log.Fatalf("newServer: udp dial error: %v\n", err)
-		}
-		s.peer_encs[id] = gob.NewEncoder(conn)
-		s.peer_addrs[id] = &site_addr
-	}
 	return &s
 }
 
-// stdin_read_loop infinitely loops while polling the stdin
-// file descriptor for user input, and passing that to the
-// user channel
-func stdin_read_loop(stdin_c chan string, reader *bufio.Reader) {
-	b := make([]byte, max_pkt_size)
+func send_all_helper(msg *Message, recipients *map[string]Node, addr_fn func(Node) *net.UDPAddr) {
+	for site_id, node := range *recipients {
+		fmt.Fprintf(os.Stderr, "sending %s to %s addr: %s\n", msg.messageStr(), site_id,
+			addr_fn(node).String())
+		send_msg_to_addr(msg, addr_fn(node))
+	}
+}
+
+func (srv *Server) send_all(msg *Message) {
+	switch (*msg).Contents.(type) {
+	case PrepareMessage:
+		send_all_helper(msg, &srv.peers, acceptor_addr)
+	case AcceptMessage:
+		send_all_helper(msg, &srv.peers, acceptor_addr)
+	case AcceptedMessage:
+		send_all_helper(msg, &srv.peers, learner_addr)
+	default:
+		log.Fatalf("send_all: invalid message format")
+	}
+}
+
+func (srv *Server) send_to_id(msg *Message, site_id string) {
+	var addr *net.UDPAddr
+	switch msg.Contents.(type) {
+	case PromiseMessage:
+		addr = proposer_addr(srv.peers[site_id])
+	case AcknowledgeMessage:
+		addr = proposer_addr(srv.peers[site_id])
+	case NackMessage:
+		addr = proposer_addr(srv.peers[site_id])
+	default:
+		log.Fatalf("send_to_id: Invalid Message Format\n")
+	}
+
+	fmt.Fprintf(os.Stderr, "sending %s to %s addr: %s\n", msg.messageStr(), site_id,
+		addr.String())
+	send_msg_to_addr(msg, addr)
+}
+
+func (prop *Proposer) create_prepare_message() PrepareMessage {
+	return PrepareMessage{
+		ProposalNumber: prop.maxPropNum}
+}
+
+func (acc *Acceptor) create_promise_message(PrepareNumber int) PromiseMessage {
+	return PromiseMessage{
+		IsNull:         acc.isNull,
+		ProposalNumber: PrepareNumber,
+		AcceptNum:      acc.acceptNum,
+		AcceptVal:      acc.acceptVal}
+}
+
+func (acc *Acceptor) create_accepted_message() AcceptedMessage {
+	if acc.isNull {
+		log.Fatalf("create_accepted_message: acc is null")
+	}
+	return AcceptedMessage{
+		AcceptNum: acc.acceptNum,
+		AcceptVal: acc.acceptVal}
+}
+
+// Acceptor
+func (srv *Server) handle_prepare(LogIndex int, SenderID string,
+	prepareMsg PrepareMessage) {
+	srv.px.gmtx.Lock()
+	if _, ok := srv.px.acceptor_records[LogIndex]; !ok {
+		srv.px.acceptor_records[LogIndex] = *dflAcceptor()
+	}
+
+	acceptor := srv.px.acceptor_records[LogIndex]
+
+	if prepareMsg.ProposalNumber > acceptor.maxPrepare {
+		acceptor.maxPrepare = prepareMsg.ProposalNumber
+		srv.px.acceptor_records[LogIndex] = acceptor
+		promiseMessageWrap := &Message{
+			LogIndex: LogIndex,
+			SenderID: srv.site_id,
+			Contents: acceptor.create_promise_message(prepareMsg.ProposalNumber),
+		}
+		srv.send_to_id(promiseMessageWrap, SenderID)
+	} else {
+		nackMessageWrap := &Message{
+			LogIndex: LogIndex,
+			SenderID: srv.site_id,
+			Contents: NackMessage{
+				ProposalNumber: prepareMsg.ProposalNumber,
+				PrepareNumber:  acceptor.maxPrepare}}
+		srv.send_to_id(nackMessageWrap, SenderID)
+	}
+
+	srv.px.gmtx.Unlock()
+}
+
+// Acceptor
+func (srv *Server) handle_accept(LogIndex int, SenderID string,
+	acceptMsg AcceptMessage) {
+	srv.px.gmtx.Lock()
+	acceptor := srv.px.acceptor_records[LogIndex]
+	if acceptMsg.ProposalNumber >= acceptor.maxPrepare {
+		acceptor.isNull = false
+		acceptor.maxPrepare = acceptMsg.ProposalNumber
+		acceptor.acceptNum = acceptMsg.ProposalNumber
+		acceptor.acceptVal = acceptMsg.ProposalVal
+		srv.px.acceptor_records[LogIndex] = acceptor
+		acceptedMessageWrap := &Message{
+			LogIndex: LogIndex,
+			SenderID: srv.site_id,
+			Contents: acceptor.create_accepted_message()}
+		acknowledgeMessageWrap := &Message{
+			LogIndex: LogIndex,
+			SenderID: srv.site_id,
+			Contents: AcknowledgeMessage{ProposalNumber: acceptMsg.ProposalNumber}}
+		srv.send_to_id(acknowledgeMessageWrap, SenderID)
+		srv.send_all(acceptedMessageWrap)
+	} else {
+		nackMessageWrap := &Message{
+			LogIndex: LogIndex,
+			SenderID: srv.site_id,
+			Contents: NackMessage{
+				ProposalNumber: acceptMsg.ProposalNumber,
+				PrepareNumber:  acceptor.maxPrepare}}
+		srv.send_to_id(nackMessageWrap, SenderID)
+	}
+	srv.px.gmtx.Unlock()
+}
+
+func (srv *Server) acceptor_loop() {
 	for {
-		n, err := reader.Read(b)
-		if err != nil {
-			if err != io.EOF {
-				fmt.Fprintf(os.Stderr, "Read error: %v\n", err)
+		msg := <-srv.acceptor_chan
+		LogIndex := msg.LogIndex
+		SenderID := msg.SenderID
+		switch v := msg.Contents.(type) {
+		case PrepareMessage:
+			srv.handle_prepare(LogIndex, SenderID, v)
+		case AcceptMessage:
+			srv.handle_accept(LogIndex, SenderID, v)
+		default:
+			log.Fatalf("acceptor_loop: invalid message format\n")
+		}
+	}
+}
+
+func on_learned_str(ev *LogEvent) string {
+	switch ev.OpCode {
+	case Order:
+		return fmt.Sprintf("Order submitted for %s.", ev.Name)
+	case Cancel:
+		return fmt.Sprintf("Order for %s cancelled.", ev.Name)
+	default:
+		log.Fatal("on_learned_str: invalid OpCode\n")
+		return ""
+	}
+}
+
+// To be used with gmtx acquired
+func (srv *Server) get_corresponding_order(ev *LogEvent) *LogEvent {
+	if ev.OpCode != Cancel {
+		log.Fatalf("get_corresponding_order: invalid OpCode\n")
+		return nil
+	}
+
+	for lindex := srv.px.learner_records.highestLogIndex; lindex >= 0; lindex-- {
+		mjr := srv.px.learner_records.getMajority(lindex)
+		if mjr != nil && mjr.Name == ev.Name {
+			switch mjr.OpCode {
+			case Cancel:
+				return nil
+			case Order:
+				return mjr
 			}
+		}
+	}
+	return nil
+}
+
+// To be used with gmtx acquired
+func (srv *Server) can_apply_log_event(ev *LogEvent) bool {
+	NumHoles := srv.px.learner_records.highestLogIndex + 1 - srv.px.learner_records.logSize
+	if NumHoles > 0 {
+		return false
+	}
+	if ev.OpCode == Cancel {
+		return srv.get_corresponding_order(ev) != nil
+	} else {
+		for i := 0; i < 4; i++ {
+			if ev.Amounts[i] > srv.px.learner_records.inventoryAmounts[i] {
+				return false
+			}
+		}
+		return true
+	}
+}
+
+// To be used with gmtx acquired
+func (srv *Server) apply_log_event(ev *LogEvent) {
+	if ev.OpCode == Cancel {
+		associatedOrder := srv.get_corresponding_order(ev)
+		for i := 0; i < 4; i++ {
+			srv.px.learner_records.inventoryAmounts[i] += associatedOrder.Amounts[i]
+		}
+	} else {
+		for i := 0; i < 4; i++ {
+			srv.px.learner_records.inventoryAmounts[i] -= ev.Amounts[i]
+		}
+	}
+}
+
+// Learner
+func (srv *Server) handle_accepted(LogIndex int, SenderID string,
+	acceptedMsg AcceptedMessage) {
+	srv.px.gmtx.Lock()
+	if _, slot_exists := srv.px.learner_records.log[LogIndex]; !slot_exists {
+		srv.px.learner_records.log[LogIndex] = make(map[string]LogEvent)
+	}
+	if _, accept_exists := srv.px.learner_records.log[LogIndex][SenderID]; !accept_exists {
+		majorityBefore := srv.px.learner_records.getMajority(LogIndex)
+		srv.px.learner_records.log[LogIndex][SenderID] = acceptedMsg.AcceptVal
+		majorityAfter := srv.px.learner_records.getMajority(LogIndex)
+		if majorityBefore == nil {
+
+			if majorityAfter != nil {
+				srv.apply_log_event(&acceptedMsg.AcceptVal)
+				srv.px.learner_records.logSize++
+				if LogIndex > srv.px.learner_records.highestLogIndex {
+					srv.px.learner_records.highestLogIndex = LogIndex
+				}
+				if majorityAfter.Proposer_id == srv.site_id {
+					fmt.Fprintln(os.Stdout, on_learned_str(majorityAfter))
+				}
+			}
+		} else {
+			if majorityAfter == nil || majorityBefore.logEventStr() != majorityAfter.logEventStr() {
+				log.Fatal("handle_accepted: learned value changed!!!")
+			}
+		}
+	}
+	srv.px.gmtx.Unlock()
+}
+
+func (srv *Server) learner_loop() {
+	for {
+		msg := <-srv.learner_chan
+		LogIndex := msg.LogIndex
+		SenderID := msg.SenderID
+		switch v := msg.Contents.(type) {
+		case AcceptedMessage:
+			srv.handle_accepted(LogIndex, SenderID, v)
+		default:
+			log.Fatalf("learner_loop: invalid message format\n")
+		}
+	}
+}
+
+func (srv *Server) synod_attempt(propVal *LogEvent, LogIndex int) {
+	srv.px.mlbx_mtx.Lock()
+	if _, mlbxExists := srv.px.proposer_mlbx[LogIndex]; !mlbxExists {
+		srv.px.proposer_mlbx[LogIndex] = make_message_chan()
+	} else {
+		log.Fatalf("synod_attempt: two simultaneous synod attempts for the same log slot\n")
+		return
+	}
+
+	mlbx := srv.px.proposer_mlbx[LogIndex]
+	srv.px.mlbx_mtx.Unlock()
+	srv.px.gmtx.Lock()
+	if _, propExists := srv.px.proposer_records[LogIndex]; !propExists {
+		srv.px.proposer_records[LogIndex] = *dflProposer(srv.site_ord)
+	}
+	proposer_record := srv.px.proposer_records[LogIndex]
+	srv.px.gmtx.Unlock()
+	nackMaxPrepare := 0
+
+	for tries := 0; tries < max_tries; tries += 1 {
+
+		srv.px.gmtx.Lock()
+		proposer_record.maxPropNum += len(srv.peers)
+		if proposer_record.maxPropNum < nackMaxPrepare {
+			b1 := proposer_record.maxPropNum
+			b2 := nackMaxPrepare
+			proposer_record.maxPropNum = proposer_record.maxPropNum +
+				((nackMaxPrepare-proposer_record.maxPropNum+len(srv.peers)-1)/len(srv.peers))*len(srv.peers)
+			fmt.Printf("propNum: %d\n, nackMaxPrepare: %d\n, propNumAfter: %d\n",
+				b1, b2, proposer_record.maxPropNum)
+			// maxPropNum = ceil((nackMaxPrepare - maxPropNum)/N) * N + maxPropNum
+		}
+
+		// proposer_record.maxPropNum: the proposal number for the current round
+		srv.px.proposer_records[LogIndex] = proposer_record
+
+		prepareWrap := &Message{
+			LogIndex: LogIndex,
+			SenderID: srv.site_id,
+			Contents: proposer_record.create_prepare_message()}
+		srv.px.gmtx.Unlock()
+
+		srv.send_all(prepareWrap)
+
+		numPromises := make(map[string]bool)
+		numNacks := make(map[string]bool)
+
+		var acceptorAccVal *LogEvent = nil
+		maxAcceptorAccNum := -1
+		timer := time.After(synod_timeout)
+		for {
+			select {
+			case msg := <-mlbx:
+				switch v := msg.Contents.(type) {
+				case PromiseMessage:
+					if v.ProposalNumber != proposer_record.maxPropNum {
+						continue
+					}
+					numPromises[msg.SenderID] = true
+					if !v.IsNull && v.AcceptNum > maxAcceptorAccNum {
+						maxAcceptorAccNum = v.AcceptNum
+						acceptorAccVal = &v.AcceptVal
+					}
+					if len(numPromises)*2 > len(srv.peers) {
+						goto afterPhase1
+					}
+				case NackMessage:
+					if v.ProposalNumber != proposer_record.maxPropNum {
+						continue
+					}
+					if v.PrepareNumber > nackMaxPrepare {
+						nackMaxPrepare = v.PrepareNumber
+					}
+					numNacks[msg.SenderID] = true
+					if len(numNacks)*2 > len(srv.peers) {
+						goto afterPhase1
+					}
+
+				default:
+					// skip non-promise messages
+				}
+			case <-timer:
+				goto afterPhase1
+			}
+		}
+	afterPhase1:
+		if len(numPromises)*2 <= len(srv.peers) {
+			continue
+		}
+		var acceptMsg *AcceptMessage
+		if acceptorAccVal == nil {
+			if propVal == nil {
+				// This only happens during recovery
+				continue
+			}
+			acceptMsg = &AcceptMessage{
+				ProposalNumber: proposer_record.maxPropNum,
+				ProposalVal:    *propVal}
+		} else {
+			acceptMsg = &AcceptMessage{
+				ProposalNumber: proposer_record.maxPropNum,
+				ProposalVal:    *acceptorAccVal}
+		}
+		acceptMsgWrap := &Message{
+			LogIndex: LogIndex,
+			SenderID: srv.site_id,
+			Contents: *acceptMsg}
+
+		for k := range numNacks {
+			delete(numNacks, k)
+		}
+
+		srv.send_all(acceptMsgWrap)
+		timer = time.After(synod_timeout)
+		numAcknowledges := make(map[string]bool)
+
+		for {
+			select {
+			case msg := <-mlbx:
+				switch v := msg.Contents.(type) {
+				case AcknowledgeMessage:
+					if v.ProposalNumber == proposer_record.maxPropNum {
+						numAcknowledges[msg.SenderID] = true
+						if len(numAcknowledges)*2 > len(srv.peers) {
+							goto afterPhase2
+						}
+					}
+				case NackMessage:
+					if v.ProposalNumber == proposer_record.maxPropNum {
+						numNacks[msg.SenderID] = true
+						if v.PrepareNumber > nackMaxPrepare {
+							nackMaxPrepare = v.PrepareNumber
+						}
+						if len(numNacks)*2 > len(srv.peers) {
+							goto afterPhase2
+						}
+					}
+				default:
+					// Skip non-acknowledge messages
+				}
+			case <-timer:
+				goto afterPhase2
+			}
+		}
+	afterPhase2:
+		if len(numAcknowledges)*2 > len(srv.peers) {
 			break
 		}
-		stdin_c <- string(b[:n])
+	}
+
+	srv.px.mlbx_mtx.Lock()
+	delete(srv.px.proposer_mlbx, LogIndex)
+	srv.px.mlbx_mtx.Unlock()
+	<-time.After(2 * synod_timeout)
+}
+
+func on_unsuccessful_commit_attempt_str(ev *LogEvent) string {
+	switch ev.OpCode {
+	case Order:
+		return fmt.Sprintf("Cannot place order for %s.", ev.Name)
+	case Cancel:
+		return fmt.Sprintf("Cannot cancel order for %s.", ev.Name)
+	default:
+		log.Fatal("on_unsuccessful_commit_attempt_str: Invalid OpCode\n")
+		return ""
 	}
 }
 
-// netwk_read_loop infinitely loops while polling a UDP socket
-// for messages from other nodes. Upon receiving, it will push
-// unmarshal and then push messages to a network message
-// designated channel
-func netwk_read_loop(netwk_c chan Message, reader *net.UDPConn) {
-	dec := gob.NewDecoder(reader)
-	for {
-		var m Message
-		err := dec.Decode(&m)
-		if err != nil {
-			if err != io.EOF {
-				log.Fatalf("netwk_read_loop: Decode error: %v\n", err)
+func (srv *Server) fill_holes(LogIndex, numHoles int) {
+	if numHoles > 0 {
+		var wg sync.WaitGroup
+		wg.Add(numHoles)
+		for i := LogIndex - 1; numHoles > 0; i-- {
+			if srv.px.learner_records.getMajority(i) == nil {
+				numHoles -= 1
+				go func(lindex int) {
+					srv.synod_attempt(nil, lindex)
+					wg.Done()
+				}(i)
 			}
-			break
 		}
-		netwk_c <- m
+		wg.Wait()
 	}
 }
 
-// parse a comma separated list of integers
-// into an array of ints
-func parse_int_list(line *string) []int {
-	str_list := strings.Split(*line, ",")
-	arr := make([]int, len(str_list))
+func (srv *Server) synod_recover() {
+	srv.px.gmtx.Lock()
+	LogIndex := srv.px.learner_records.highestLogIndex + 1
+	numHoles := LogIndex - srv.px.learner_records.logSize
+	srv.px.gmtx.Unlock()
 
-	for i := 0; i < len(arr); i++ {
-		tmp, err := strconv.ParseInt(str_list[i], 10, 31)
-		if err != nil {
-			return make([]int, 0)
-		}
-		arr[i] = int(tmp)
+	srv.fill_holes(LogIndex, numHoles)
+
+	srv.synod_attempt(nil, LogIndex)
+
+	srv.px.gmtx.Lock()
+	mjr := srv.px.learner_records.getMajority(LogIndex)
+	cont := mjr != nil
+	srv.px.gmtx.Unlock()
+	if cont {
+		srv.synod_recover()
 	}
-	return arr
 }
 
+func (srv *Server) submit_proposal(propVal *LogEvent) {
+	srv.px.gmtx.Lock()
+	LogIndex := srv.px.learner_records.highestLogIndex + 1
+	numHoles := LogIndex - srv.px.learner_records.logSize
+	srv.px.gmtx.Unlock()
+
+	srv.fill_holes(LogIndex, numHoles)
+
+	srv.px.gmtx.Lock()
+	canApply := srv.can_apply_log_event(propVal)
+	srv.px.gmtx.Unlock()
+	if canApply {
+		// If canApply is no longer true, this would only happen
+		// if this log slot is no longer free. Starting a synod attempt
+		// in this case won't break the algorithm
+		srv.synod_attempt(propVal, LogIndex)
+	}
+
+	srv.px.gmtx.Lock()
+	mjr := srv.px.learner_records.getMajority(LogIndex)
+	if mjr == nil || mjr.logEventStr() != propVal.logEventStr() {
+		fmt.Fprintln(os.Stdout, on_unsuccessful_commit_attempt_str(propVal))
+	}
+	srv.px.gmtx.Unlock()
+}
+
+// Proposer
 func (srv *Server) handle_order(name string, amt [4]int) {
 	propVal := LogEvent{
 		OpCode:      Order,
 		Name:        name,
 		Amounts:     amt,
 		Proposer_id: srv.site_id}
-	srv.maxLogIndex += 1
-	srv.start_synod(srv.maxLogIndex, srv.site_ord, propVal)
+
+	srv.submit_proposal(&propVal)
 }
 
+// Proposer
 func (srv *Server) handle_cancel(name string) {
-
+	propVal := LogEvent{
+		OpCode:      Cancel,
+		Name:        name,
+		Amounts:     [4]int{-1, -1, -1, -1},
+		Proposer_id: srv.site_id}
+	srv.submit_proposal(&propVal)
 }
 
+// Proposer
 func (srv *Server) handle_list_orders() {
-
-}
-
-func (srv *Server) handle_list_inventory() {
-
-}
-
-func (srv *Server) handle_list_log() {
-
-}
-
-func (srv *Server) handle_prepare(prepareMsgPkg Message) {
-
-}
-
-func (srv *Server) handle_accept(acceptMsgPkg Message) {
-
-}
-
-func (srv *Server) handle_accepted(acceptedMsgPkg Message) {
-
-}
-
-func (srv *Server) handle_receive(msg Message) {
-	{
-		// Handled by acceptor
-		if _, ok := msg.Contents.(PrepareMessage); ok {
-			srv.handle_prepare(msg)
-			return
-		}
-	}
-
-	{
-		// Handled by proposer
-		if _, ok := msg.Contents.(PromiseMessage); ok {
-			logIdx := msg.LogIndex
-			srv.server_mu.Lock()
-			if prop_chan, ok := srv.proposer_chans[logIdx]; ok {
-				prop_chan <- msg
+	srv.px.gmtx.Lock()
+	defer srv.px.gmtx.Unlock()
+	counter := make(map[string]int)
+	orders := make([]*LogEvent, 0)
+	for lindex := srv.px.learner_records.highestLogIndex; lindex >= 0; lindex-- {
+		if ev := srv.px.learner_records.getMajority(lindex); ev != nil {
+			if _, exists := counter[ev.Name]; !exists {
+				counter[ev.Name] = 0
 			}
-			srv.server_mu.Unlock()
-			return
+			if ev.OpCode == Cancel {
+				counter[ev.Name] -= 1
+			} else {
+				counter[ev.Name] += 1
+			}
+			if counter[ev.Name] > 0 {
+				orders = append(orders, ev)
+			}
 		}
 	}
+	sort.Slice(orders, func(i, j int) bool {
+		return orders[i].Name < orders[j].Name
+	})
+	for _, order := range orders {
+		fmt.Fprintf(os.Stdout, "%s %s\n", order.Name, amountsStr(order.Amounts))
+	}
+}
 
-	{
-		// Handled by acceptor
-		if _, ok := msg.Contents.(AcceptMessage); ok {
-			srv.handle_accept(msg)
-			return
+// Proposer
+func (srv *Server) handle_list_inventory() {
+	for idx, val := range item_names {
+		fmt.Fprintf(os.Stdout, "%s %d\n",
+			val, srv.px.learner_records.inventoryAmounts[idx])
+	}
+}
+
+// Proposer
+func (srv *Server) handle_list_log() {
+	srv.px.gmtx.Lock()
+	defer srv.px.gmtx.Unlock()
+	for lindex := 0; lindex <= srv.px.learner_records.highestLogIndex; lindex++ {
+		if mjr := srv.px.learner_records.getMajority(lindex); mjr != nil {
+			if mjr.OpCode == Order {
+				fmt.Fprintf(os.Stdout, "order %s %s\n", mjr.Name, amountsStr(mjr.Amounts))
+			} else {
+				fmt.Fprintf(os.Stdout, "cancel %s\n", mjr.Name)
+			}
+		} else {
+			fmt.Fprint(os.Stdout, "\n")
 		}
 	}
-
-	{
-		// Handled by learner
-		if _, ok := msg.Contents.(AcceptedMessage); ok {
-			srv.handle_accepted(msg)
-			return
-		}
-	}
-
-	log.Fatal("handle_receive: Invalid Message Format")
 }
 
 func (srv *Server) on_user_input(user_input string) {
@@ -417,99 +941,164 @@ func (srv *Server) on_user_input(user_input string) {
 	}
 }
 
-// Starts a paxos run for a particular log slot
-func (srv *Server) start_synod(logIndex int, maxPropNum int, proposedVal LogEvent) {
-	srv.server_mu.Lock()
-	if _, exists := srv.proposer_chans[logIndex]; exists {
-		srv.server_mu.Unlock()
-		log.Fatalf("start_synod(%d, %d, %s): synod already exists",
-			logIndex, maxPropNum, proposedVal.OpCode.opCodeStr())
-	}
-
-	if _, exists := srv.log[logIndex]; exists {
-		srv.server_mu.Unlock()
-		log.Fatalf("start_synod(%d, %d, %s): log slot value already learned",
-			logIndex, maxPropNum, proposedVal.OpCode.opCodeStr())
-	}
-	srv.server_mu.Unlock()
-	go srv.proposer_loop(logIndex, maxPropNum, proposedVal)
-}
-
-// proposer for a process and a log slot
-func (srv *Server) proposer_loop(logIndex int, maxPropNum int, proposedVal LogEvent) {
-	srv.server_mu.Lock()
-	if _, exists := srv.proposer_chans[logIndex]; exists {
-		srv.server_mu.Unlock()
-		log.Fatalf("proposer_loop[%d]: Two proposer loops for the same log slot", logIndex)
-	}
-	srv.proposer_chans[logIndex] = make(chan Message)
-	srv.maxPropNums[logIndex] = maxPropNum + srv.site_ord
-	srv.server_mu.Unlock()
-	prepareMsg := PrepareMessage{
-		PrepareNumber: srv.maxPropNums[logIndex]}
-	prepareMsgWrap := Message{
-		LogIndex: logIndex,
-		SenderID: srv.site_id,
-		Contents: prepareMsg}
-	srv.sendall(prepareMsgWrap)
-
+func (srv *Server) proposer_loop() {
 	for {
-		srv.server_mu.Lock()
-		mesg := <-srv.proposer_chans[logIndex]
-		srv.server_mu.Unlock()
-		fmt.Printf("Proposer Loop Mesg From: %s\n", mesg.SenderID)
+		user_input := <-srv.stdin_c
+		srv.on_user_input(user_input)
 	}
-
-	srv.server_mu.Lock()
-	delete(srv.proposer_chans, logIndex)
-	srv.server_mu.Unlock()
 }
 
-func (srv *Server) sendall(m Message) {
-	mesgStr := m.messageStr()
-	for site_id, site_enc := range srv.peer_encs {
-		fmt.Fprintf(os.Stderr, "sending %s to %s\n", mesgStr, site_id)
-		err := site_enc.Encode(&m)
-		if err != nil {
-			log.Fatalf("udp Encode error: %v\n", err)
+func (srv *Server) proposer_netwk_loop(conn *net.UDPConn) {
+	for {
+		msg := recv_from_conn(conn)
+		srv.px.mlbx_mtx.Lock()
+		if mlbx, mlbxExists := srv.px.proposer_mlbx[msg.LogIndex]; mlbxExists {
+			mlbx <- *msg
 		}
+		srv.px.mlbx_mtx.Unlock()
 	}
 }
 
 func (srv *Server) run() {
 	stdin_reader := bufio.NewReader(os.Stdin)
-	ser, err := net.ListenUDP("udp", srv.peer_addrs[srv.site_id])
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "ListenUDP error: %v\n", err)
-	}
+	p_addr := proposer_addr(srv.peers[srv.site_id])
+	a_addr := acceptor_addr(srv.peers[srv.site_id])
+	l_addr := learner_addr(srv.peers[srv.site_id])
 
+	proposer_listener := make_listener(p_addr)
+	acceptor_listener := make_listener(a_addr)
+	learner_listener := make_listener(l_addr)
+
+	go srv.proposer_netwk_loop(proposer_listener)
+	go netwk_read_loop(srv.acceptor_chan, acceptor_listener)
+	go netwk_read_loop(srv.learner_chan, learner_listener)
 	go stdin_read_loop(srv.stdin_c, stdin_reader)
-	go netwk_read_loop(srv.netwk_c, ser)
+	go srv.learner_loop()
+	go srv.acceptor_loop()
 
-	for {
-		select {
-		case user_input := <-srv.stdin_c:
-			srv.on_user_input(user_input)
-		case mesg := <-srv.netwk_c:
-			fmt.Fprintf(os.Stderr, "received %s from %s\n", mesg.messageStr(), mesg.SenderID)
-			srv.handle_receive(mesg)
+	// Recovery:
+	srv.synod_recover()
+
+	srv.proposer_loop()
+}
+
+func (ev *LogEvent) logEventStr() string {
+	if ev == nil {
+		return ""
+	}
+	switch ev.OpCode {
+	case Order:
+		return fmt.Sprintf("order %s %s @ %s",
+			ev.Name, amountsStr(ev.Amounts), ev.Proposer_id)
+	case Cancel:
+		return fmt.Sprintf("cancel %s @ %s", ev.Name, ev.Proposer_id)
+	default:
+		log.Fatal("logEventStr: Invalid Opcode")
+		return ""
+	}
+}
+func (msg *Message) messageStr() string {
+	switch v := msg.Contents.(type) {
+	case PrepareMessage:
+		return fmt.Sprintf("prepare[%d](%d)",
+			msg.LogIndex, v.ProposalNumber)
+	case PromiseMessage:
+		if v.IsNull {
+			return fmt.Sprintf("promise[%d](null, null, prepare:%d)",
+				msg.LogIndex, v.ProposalNumber)
 		}
+		return fmt.Sprintf("promise[%d](%d, `%s`)",
+			msg.LogIndex, v.AcceptNum,
+			v.AcceptVal.logEventStr())
+	case AcceptMessage:
+		return fmt.Sprintf("accept[%d](%d, `%s`)",
+			msg.LogIndex, v.ProposalNumber,
+			v.ProposalVal.logEventStr())
+	case AcceptedMessage:
+		return fmt.Sprintf("accepted[%d](%d, `%s`)",
+			msg.LogIndex, v.AcceptNum,
+			v.AcceptVal.logEventStr())
+	case AcknowledgeMessage:
+		return fmt.Sprintf("ack[%d](%d)", msg.LogIndex, v.ProposalNumber)
+	case NackMessage:
+		return fmt.Sprintf("nack[%d](prepare_number: %d, proposal_number: %d)",
+			msg.LogIndex, v.PrepareNumber, v.ProposalNumber)
+	default:
+		log.Fatal("messageStr: Invalid Message Format")
+		return ""
 	}
 }
 
-func main() {
+// amountsStr converts an array of 4 integers representing
+// the inventory to a comma delimited string.
+func amountsStr(amounts [4]int) string {
+	var amountsStrVec [4]string
+	for i := 0; i < 4; i++ {
+		amountsStrVec[i] = fmt.Sprint(amounts[i])
+	}
+	return strings.Join(amountsStrVec[:], ",")
+}
 
+// stdin_read_loop infinitely loops while polling the stdin
+// file descriptor for user input, and passing that to the
+// user channel
+func stdin_read_loop(stdin_c chan string, reader *bufio.Reader) {
+	for {
+		b, err := reader.ReadString('\n')
+		if err != nil {
+			if err != io.EOF {
+				fmt.Fprintf(os.Stderr, "Read error: %v\n", err)
+			}
+			break
+		}
+		stdin_c <- b
+	}
+}
+
+// netwk_read_loop infinitely loops while polling a UDP socket
+// for messages from other nodes. Upon receiving, it will push
+// unmarshal and then push messages to a network message
+// designated channel
+func netwk_read_loop(netwk_c chan Message, conn *net.UDPConn) {
+	for {
+		m := recv_from_conn(conn)
+		netwk_c <- *m
+	}
+}
+
+// parse a comma separated list of integers
+// into an array of ints
+func parse_int_list(line *string) []int {
+	str_list := strings.Split(*line, ",")
+	arr := make([]int, len(str_list))
+
+	for i := 0; i < len(arr); i++ {
+		tmp, err := strconv.ParseInt(str_list[i], 10, 31)
+		if err != nil {
+			return make([]int, 0)
+		}
+		arr[i] = int(tmp)
+	}
+	return arr
+}
+
+func main() {
+	rand.Seed(time.Now().UnixNano())
 	args := os.Args
 
 	gob.Register(Message{})
+	gob.Register(AcknowledgeMessage{})
 	gob.Register(PrepareMessage{})
 	gob.Register(AcceptMessage{})
 	gob.Register(AcceptedMessage{})
 	gob.Register(PromiseMessage{})
+	gob.Register(NackMessage{})
+	gob.Register(LogEvent{})
 
 	if len(args) != 2 {
 		log.Fatal("USAGE: ./main <site_id>")
 	}
+
 	site_id := args[1]
 	knownhosts_f, err := os.Open("knownhosts.json")
 
@@ -523,6 +1112,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("Error unmarshalling in main: %v\n", err)
 	}
+
 	s := newServer(site_id, peers)
 	s.run()
 }
