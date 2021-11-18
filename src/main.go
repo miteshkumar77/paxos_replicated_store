@@ -23,9 +23,9 @@ const max_tries = 3
 
 const synod_timeout = time.Millisecond * 200
 
-const max_pkt_size = 65507
+// const synod_timeout = time.Second * 5
 
-var bind_addr = net.UDPAddr{IP: net.ParseIP("0.0.0.0")}
+const max_pkt_size = 65507
 
 const channel_capacity = 10000
 
@@ -57,8 +57,8 @@ func make_listener(addr *net.UDPAddr) *net.UDPConn {
 
 func send_msg_to_addr(msg *Message, addr *net.UDPAddr) {
 	// go func(msg Message, addr *net.UDPAddr) {
-	// n := rand.Intn(5)
-	// time.Sleep(time.Duration(n) * time.Second)
+	// 	n := rand.Intn(3)
+	// 	time.Sleep(time.Duration(n) * time.Second)
 	var b bytes.Buffer
 	enc := gob.NewEncoder(&b)
 	err := enc.Encode(msg)
@@ -603,11 +603,6 @@ func (srv *Server) synod_attempt(propVal *LogEvent, LogIndex int) {
 
 		srv.px.gmtx.Lock()
 		proposer_record.maxPropNum += len(srv.peers)
-		if proposer_record.maxPropNum < nackMaxPrepare {
-			proposer_record.maxPropNum = proposer_record.maxPropNum +
-				((nackMaxPrepare-proposer_record.maxPropNum+len(srv.peers)-1)/len(srv.peers))*len(srv.peers)
-			// maxPropNum = ceil((nackMaxPrepare - maxPropNum)/N) * N + maxPropNum
-		}
 
 		// proposer_record.maxPropNum: the proposal number for the current round
 		srv.px.proposer_records[LogIndex] = proposer_record
@@ -622,7 +617,9 @@ func (srv *Server) synod_attempt(propVal *LogEvent, LogIndex int) {
 
 		numPromises := make(map[string]bool)
 		numNacks := make(map[string]bool)
-
+		numAcknowledges := make(map[string]bool)
+		var acceptMsgWrap *Message
+		var acceptMsg *AcceptMessage
 		var acceptorAccVal *LogEvent = nil
 		maxAcceptorAccNum := -1
 		timer := time.After(synod_timeout)
@@ -631,27 +628,25 @@ func (srv *Server) synod_attempt(propVal *LogEvent, LogIndex int) {
 			case msg := <-mlbx:
 				switch v := msg.Contents.(type) {
 				case PromiseMessage:
-					if v.ProposalNumber != proposer_record.maxPropNum {
-						continue
-					}
-					numPromises[msg.SenderID] = true
-					if !v.IsNull && v.AcceptNum > maxAcceptorAccNum {
-						maxAcceptorAccNum = v.AcceptNum
-						acceptorAccVal = &v.AcceptVal
-					}
-					if len(numPromises)*2 > len(srv.peers) {
-						goto afterPhase1
+					if v.ProposalNumber == proposer_record.maxPropNum {
+						numPromises[msg.SenderID] = true
+						if !v.IsNull && v.AcceptNum > maxAcceptorAccNum {
+							maxAcceptorAccNum = v.AcceptNum
+							acceptorAccVal = &v.AcceptVal
+						}
+						if len(numPromises)*2 > len(srv.peers) {
+							goto afterPhase1
+						}
 					}
 				case NackMessage:
-					if v.ProposalNumber != proposer_record.maxPropNum {
-						continue
-					}
-					if v.PrepareNumber > nackMaxPrepare {
-						nackMaxPrepare = v.PrepareNumber
-					}
-					numNacks[msg.SenderID] = true
-					if len(numNacks)*2 > len(srv.peers) {
-						goto afterPhase1
+					if v.ProposalNumber == proposer_record.maxPropNum {
+						if v.PrepareNumber > nackMaxPrepare {
+							nackMaxPrepare = v.PrepareNumber
+						}
+						numNacks[msg.SenderID] = true
+						if len(numNacks)*2 > len(srv.peers) {
+							goto afterPhase1
+						}
 					}
 
 				default:
@@ -663,13 +658,12 @@ func (srv *Server) synod_attempt(propVal *LogEvent, LogIndex int) {
 		}
 	afterPhase1:
 		if len(numPromises)*2 <= len(srv.peers) {
-			continue
+			goto afterPhase2
 		}
-		var acceptMsg *AcceptMessage
 		if acceptorAccVal == nil {
 			if propVal == nil {
 				// This only happens during recovery
-				continue
+				goto afterPhase2
 			}
 			acceptMsg = &AcceptMessage{
 				ProposalNumber: proposer_record.maxPropNum,
@@ -679,7 +673,7 @@ func (srv *Server) synod_attempt(propVal *LogEvent, LogIndex int) {
 				ProposalNumber: proposer_record.maxPropNum,
 				ProposalVal:    *acceptorAccVal}
 		}
-		acceptMsgWrap := &Message{
+		acceptMsgWrap = &Message{
 			LogIndex: LogIndex,
 			SenderID: srv.site_id,
 			Contents: *acceptMsg}
@@ -690,7 +684,6 @@ func (srv *Server) synod_attempt(propVal *LogEvent, LogIndex int) {
 
 		srv.send_all(acceptMsgWrap)
 		timer = time.After(synod_timeout)
-		numAcknowledges := make(map[string]bool)
 
 		for {
 			select {
@@ -720,9 +713,15 @@ func (srv *Server) synod_attempt(propVal *LogEvent, LogIndex int) {
 				goto afterPhase2
 			}
 		}
+
 	afterPhase2:
 		if len(numAcknowledges)*2 > len(srv.peers) {
 			break
+		}
+		if proposer_record.maxPropNum < nackMaxPrepare {
+			proposer_record.maxPropNum = proposer_record.maxPropNum +
+				((nackMaxPrepare-proposer_record.maxPropNum+len(srv.peers)-1)/len(srv.peers))*len(srv.peers)
+			// maxPropNum = ceil((nackMaxPrepare - maxPropNum)/N) * N + maxPropNum
 		}
 	}
 
