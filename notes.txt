@@ -21,3 +21,53 @@
 - send messages to proposer on port 0
 - send messages to acceptor on port 1
 - send messages to learner on port 2
+
+
+p1 p2 p3 p4, p4 has failed, at T0, p1 has detected that p4 has failed
+
+p1 sends election(1) to P2 and P3 at T0
+p2 receives election(1) at T0 + T1
+P3 receives election(1) at T0 + T2
+P2 sends ok(2) to p1 at T0 + T1 + Tproc
+P3 sends ok(3) to p1 at T0 + T2 + Tproc
+P3 sends ok(3) to p2 at T0 + T2 + Tproc
+P3 fails at T0 + T2 + Tproc
+P1 receives ok(2) at T0 + T1 + Tproc + T3
+P1 receives ok(3) at T0 + T2 + Tproc + T4
+P2 receives ok(3) at T0 + T2 + Tproc + T5
+P2 sends election(2) to P3 and P4 at T0 + T2 + Tproc + T5 + T'(2)
+P2 sends coordinator(2) to P1 at T0 + T2 + Tproc + T5 + T'(2) + T
+P1 receives coordinator(2) at T0 + T2 + Tproc + T5 + T'(2) + T + T6
+Time elapsed at P1:
+T0 + T2 + Tproc + T5 + T'(2) + T + T6 - min(T0 + T1 + Tproc + T3, T0 + T2 + Tproc + T4)
+
+= max(T2 + T5 + T'(2) + T + T6 - T1 - T3,
+      T5 + T'(2) + T + T6 - T4)
+
+= max(3Tmax - 2Tmin + T'(2) + T,
+2Tmax - Tmin + T'(2) + T)
+= 3Tmax - 2Tmin + 2Tmax + Tproc = T'(2) + 5Tmax + Tproc - 2Tmin
+
+ T0 + T2 + Tproc + T5 + T'(2) + T + T6 - 
+(T0 + T1 + Tproc + T3) = T2 + T5 + T'(2) + T + T6 - T1 - T3
+
+ T0 + T2 + Tproc + T5 + T'(2) + T + T6 - 
+(T0 + T2 + Tproc + T4) = T5 + T'(2) + T + T6 - T4
+
+
+T'(n) = (n - 2) * (5Tmax + Tproc - 2Tmin) + (3Tmax + Tproc - Tmin)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

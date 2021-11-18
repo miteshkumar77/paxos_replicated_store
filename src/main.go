@@ -21,7 +21,7 @@ import (
 
 const max_tries = 3
 
-const synod_timeout = 5 * time.Second
+const synod_timeout = time.Millisecond * 200
 
 const max_pkt_size = 65507
 
@@ -410,7 +410,7 @@ func (srv *Server) handle_prepare(LogIndex int, SenderID string,
 	} else {
 		nackMessageWrap := &Message{
 			LogIndex: LogIndex,
-			SenderID: SenderID,
+			SenderID: srv.site_id,
 			Contents: NackMessage{
 				ProposalNumber: prepareMsg.ProposalNumber,
 				PrepareNumber:  acceptor.maxPrepare}}
@@ -444,7 +444,7 @@ func (srv *Server) handle_accept(LogIndex int, SenderID string,
 	} else {
 		nackMessageWrap := &Message{
 			LogIndex: LogIndex,
-			SenderID: SenderID,
+			SenderID: srv.site_id,
 			Contents: NackMessage{
 				ProposalNumber: acceptMsg.ProposalNumber,
 				PrepareNumber:  acceptor.maxPrepare}}
@@ -488,17 +488,13 @@ func (srv *Server) get_corresponding_order(ev *LogEvent) *LogEvent {
 		return nil
 	}
 
-	counter := 0
-
 	for lindex := srv.px.learner_records.highestLogIndex; lindex >= 0; lindex-- {
 		mjr := srv.px.learner_records.getMajority(lindex)
 		if mjr != nil && mjr.Name == ev.Name {
-			if ev.OpCode == Cancel {
-				counter -= 1
-			} else {
-				counter += 1
-			}
-			if counter > 0 {
+			switch mjr.OpCode {
+			case Cancel:
+				return nil
+			case Order:
 				return mjr
 			}
 		}
@@ -608,8 +604,12 @@ func (srv *Server) synod_attempt(propVal *LogEvent, LogIndex int) {
 		srv.px.gmtx.Lock()
 		proposer_record.maxPropNum += len(srv.peers)
 		if proposer_record.maxPropNum < nackMaxPrepare {
+			b1 := proposer_record.maxPropNum
+			b2 := nackMaxPrepare
 			proposer_record.maxPropNum = proposer_record.maxPropNum +
 				((nackMaxPrepare-proposer_record.maxPropNum+len(srv.peers)-1)/len(srv.peers))*len(srv.peers)
+			fmt.Printf("propNum: %d\n, nackMaxPrepare: %d\n, propNumAfter: %d\n",
+				b1, b2, proposer_record.maxPropNum)
 			// maxPropNum = ceil((nackMaxPrepare - maxPropNum)/N) * N + maxPropNum
 		}
 
@@ -651,7 +651,7 @@ func (srv *Server) synod_attempt(propVal *LogEvent, LogIndex int) {
 						continue
 					}
 					if v.PrepareNumber > nackMaxPrepare {
-						v.PrepareNumber = nackMaxPrepare
+						nackMaxPrepare = v.PrepareNumber
 					}
 					numNacks[msg.SenderID] = true
 					if len(numNacks)*2 > len(srv.peers) {
@@ -672,7 +672,8 @@ func (srv *Server) synod_attempt(propVal *LogEvent, LogIndex int) {
 		var acceptMsg *AcceptMessage
 		if acceptorAccVal == nil {
 			if propVal == nil {
-				log.Fatal("synod_attempt: majority of acceptors with null acc val and null proposed val NOT ALLOWED")
+				// This only happens during recovery
+				continue
 			}
 			acceptMsg = &AcceptMessage{
 				ProposalNumber: proposer_record.maxPropNum,
@@ -764,6 +765,25 @@ func (srv *Server) fill_holes(LogIndex, numHoles int) {
 	}
 }
 
+func (srv *Server) synod_recover() {
+	srv.px.gmtx.Lock()
+	LogIndex := srv.px.learner_records.highestLogIndex + 1
+	numHoles := LogIndex - srv.px.learner_records.logSize
+	srv.px.gmtx.Unlock()
+
+	srv.fill_holes(LogIndex, numHoles)
+
+	srv.synod_attempt(nil, LogIndex)
+
+	srv.px.gmtx.Lock()
+	mjr := srv.px.learner_records.getMajority(LogIndex)
+	cont := mjr != nil
+	srv.px.gmtx.Unlock()
+	if cont {
+		srv.synod_recover()
+	}
+}
+
 func (srv *Server) submit_proposal(propVal *LogEvent) {
 	srv.px.gmtx.Lock()
 	LogIndex := srv.px.learner_records.highestLogIndex + 1
@@ -785,10 +805,6 @@ func (srv *Server) submit_proposal(propVal *LogEvent) {
 	srv.px.gmtx.Lock()
 	mjr := srv.px.learner_records.getMajority(LogIndex)
 	if mjr == nil || mjr.logEventStr() != propVal.logEventStr() {
-		if mjr != nil {
-			fmt.Println(mjr.logEventStr())
-			fmt.Println(propVal.logEventStr())
-		}
 		fmt.Fprintln(os.Stdout, on_unsuccessful_commit_attempt_str(propVal))
 	}
 	srv.px.gmtx.Unlock()
@@ -959,11 +975,10 @@ func (srv *Server) run() {
 	go stdin_read_loop(srv.stdin_c, stdin_reader)
 	go srv.learner_loop()
 	go srv.acceptor_loop()
-	/*
-		fmt.Printf("Proposer listening at: %s\n", p_addr.String())
-		fmt.Printf("Acceptor listening at: %s\n", a_addr.String())
-		fmt.Printf("Learner listening at: %s\n", l_addr.String())
-	*/
+
+	// Recovery:
+	srv.synod_recover()
+
 	srv.proposer_loop()
 }
 
