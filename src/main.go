@@ -541,28 +541,28 @@ func (srv *Server) handle_accepted(LogIndex int, SenderID string,
 	if _, slot_exists := srv.px.learner_records.log[LogIndex]; !slot_exists {
 		srv.px.learner_records.log[LogIndex] = make(map[string]LogEvent)
 	}
-	if _, accept_exists := srv.px.learner_records.log[LogIndex][SenderID]; !accept_exists {
-		majorityBefore := srv.px.learner_records.getMajority(LogIndex)
-		srv.px.learner_records.log[LogIndex][SenderID] = acceptedMsg.AcceptVal
-		majorityAfter := srv.px.learner_records.getMajority(LogIndex)
-		if majorityBefore == nil {
+	// if _, accept_exists := srv.px.learner_records.log[LogIndex][SenderID]; !accept_exists {
+	majorityBefore := srv.px.learner_records.getMajority(LogIndex)
+	srv.px.learner_records.log[LogIndex][SenderID] = acceptedMsg.AcceptVal
+	majorityAfter := srv.px.learner_records.getMajority(LogIndex)
+	if majorityBefore == nil {
 
-			if majorityAfter != nil {
-				srv.apply_log_event(&acceptedMsg.AcceptVal)
-				srv.px.learner_records.logSize++
-				if LogIndex > srv.px.learner_records.highestLogIndex {
-					srv.px.learner_records.highestLogIndex = LogIndex
-				}
-				if majorityAfter.Proposer_id == srv.site_id {
-					fmt.Fprintln(os.Stdout, on_learned_str(majorityAfter))
-				}
+		if majorityAfter != nil {
+			srv.apply_log_event(&acceptedMsg.AcceptVal)
+			srv.px.learner_records.logSize++
+			if LogIndex > srv.px.learner_records.highestLogIndex {
+				srv.px.learner_records.highestLogIndex = LogIndex
 			}
-		} else {
-			if majorityAfter == nil || majorityBefore.logEventStr() != majorityAfter.logEventStr() {
-				log.Fatal("handle_accepted: learned value changed!!!")
+			if majorityAfter.Proposer_id == srv.site_id {
+				fmt.Fprintln(os.Stdout, on_learned_str(majorityAfter))
 			}
 		}
+	} else {
+		if majorityAfter == nil || majorityBefore.logEventStr() != majorityAfter.logEventStr() {
+			log.Fatal("handle_accepted: learned value changed!!!")
+		}
 	}
+	// }
 	srv.px.gmtx.Unlock()
 }
 
