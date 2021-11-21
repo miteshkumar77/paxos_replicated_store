@@ -19,6 +19,8 @@ import (
 	"time"
 )
 
+const stable_path = "stable_storage.txt"
+
 const max_tries = 3
 
 const synod_timeout = time.Millisecond * 200
@@ -205,6 +207,12 @@ type Paxos struct {
 	gmtx             sync.Mutex
 }
 
+type StableState struct {
+	Proposer_records map[int]Proposer
+	Acceptor_records map[int]Acceptor
+	Learner_records  Learner
+}
+
 type Server struct {
 	site_id       string
 	peers         map[string]Node
@@ -226,6 +234,54 @@ func dflAcceptor() *Acceptor {
 		isNull:     true,
 		acceptNum:  -1,
 		acceptVal:  LogEvent{OpCode: Cancel, Name: "", Amounts: [4]int{-1. - 1. - 1. - 1}, Proposer_id: ""}}
+}
+
+func (srv *Server) dump_stable_state() {
+	store := StableState{
+		Proposer_records: srv.px.proposer_records,
+		Acceptor_records: srv.px.acceptor_records,
+		Learner_records:  srv.px.learner_records}
+
+	storage_file, err := os.OpenFile(stable_path,
+		os.O_CREATE|os.O_TRUNC|os.O_WRONLY, os.ModeAppend)
+	if err != nil {
+		log.Fatalf("dump_stable_state: file %s open error: %v\n",
+			stable_path, err)
+	}
+	enc := gob.NewEncoder(storage_file)
+	err = enc.Encode(&store)
+	if err != nil {
+		fmt.Printf("dump_stable_state: file %s encode error: %v\n",
+			stable_path, err)
+	}
+	err = storage_file.Close()
+	if err != nil {
+		fmt.Printf("dump_stable_state: file %s close error: %v\n",
+			stable_path, err)
+	}
+}
+
+func (srv *Server) read_stable_state() *StableState {
+	var store StableState
+	storage_file, err := os.Open(stable_path)
+	if err != nil {
+		log.Printf("read_stable_state: file %s open error: %v\n",
+			stable_path, err)
+		return nil
+	}
+	dec := gob.NewDecoder(storage_file)
+	err = dec.Decode(&store)
+	if err != nil {
+		fmt.Printf("read_stable_state: file %s decode error: %v\n",
+			stable_path, err)
+		return nil
+	}
+	err = storage_file.Close()
+	if err != nil {
+		fmt.Printf("read_stable_state: file %s close error: %v\n",
+			stable_path, err)
+	}
+	return &store
 }
 
 func (l *Learner) getMajority(LogIndex int) *LogEvent {
@@ -406,6 +462,7 @@ func (srv *Server) handle_prepare(LogIndex int, SenderID string,
 			SenderID: srv.site_id,
 			Contents: acceptor.create_promise_message(prepareMsg.ProposalNumber),
 		}
+		srv.dump_stable_state()
 		srv.send_to_id(promiseMessageWrap, SenderID)
 	} else {
 		nackMessageWrap := &Message{
@@ -424,8 +481,13 @@ func (srv *Server) handle_prepare(LogIndex int, SenderID string,
 func (srv *Server) handle_accept(LogIndex int, SenderID string,
 	acceptMsg AcceptMessage) {
 	srv.px.gmtx.Lock()
+
 	acceptor := srv.px.acceptor_records[LogIndex]
-	if acceptMsg.ProposalNumber >= acceptor.maxPrepare {
+	prevMjr := srv.px.learner_records.getMajority(LogIndex - 1)
+	canAccept := acceptMsg.ProposalNumber >= acceptor.maxPrepare &&
+		((acceptMsg.ProposalNumber != 0) ||
+			(prevMjr == nil || prevMjr.Proposer_id == SenderID))
+	if canAccept {
 		acceptor.isNull = false
 		acceptor.maxPrepare = acceptMsg.ProposalNumber
 		acceptor.acceptNum = acceptMsg.ProposalNumber
@@ -439,6 +501,9 @@ func (srv *Server) handle_accept(LogIndex int, SenderID string,
 			LogIndex: LogIndex,
 			SenderID: srv.site_id,
 			Contents: AcknowledgeMessage{ProposalNumber: acceptMsg.ProposalNumber}}
+
+		srv.dump_stable_state()
+
 		srv.send_to_id(acknowledgeMessageWrap, SenderID)
 		srv.send_all(acceptedMessageWrap)
 	} else {
@@ -557,6 +622,7 @@ func (srv *Server) handle_accepted(LogIndex int, SenderID string,
 				fmt.Fprintln(os.Stdout, on_learned_str(majorityAfter))
 			}
 		}
+		srv.dump_stable_state()
 	} else {
 		if majorityAfter == nil || majorityBefore.logEventStr() != majorityAfter.logEventStr() {
 			log.Fatal("handle_accepted: learned value changed!!!")
@@ -608,16 +674,18 @@ func (srv *Server) synod_attempt(propVal *LogEvent, LogIndex int) {
 	for tries := 0; tries < max_tries; tries += 1 {
 
 		srv.px.gmtx.Lock()
-		// canSkipP1 := srv.can_skip_phase_1(LogIndex) && srv.px.proposer_records[LogIndex].maxPropNum == srv.site_ord
+		canSkipP1 := srv.can_skip_phase_1(LogIndex) && tries == 0 &&
+			srv.px.proposer_records[LogIndex].maxPropNum == srv.site_ord
 		prepareMsg := proposer_record.create_prepare_message()
 		currentRoundProposalNum := prepareMsg.ProposalNumber
+		if canSkipP1 {
+			currentRoundProposalNum = 0
+		}
 		prepareWrap := &Message{
 			LogIndex: LogIndex,
 			SenderID: srv.site_id,
 			Contents: prepareMsg}
 		srv.px.gmtx.Unlock()
-
-		srv.send_all(prepareWrap)
 
 		numPromises := make(map[string]bool)
 		numNacks := make(map[string]bool)
@@ -627,6 +695,10 @@ func (srv *Server) synod_attempt(propVal *LogEvent, LogIndex int) {
 		var acceptorAccVal *LogEvent = nil
 		var timer <-chan time.Time
 		maxAcceptorAccNum := -1
+		if canSkipP1 {
+			goto afterPhase1
+		}
+		srv.send_all(prepareWrap)
 		timer = time.After(synod_timeout)
 		for {
 			select {
@@ -648,6 +720,18 @@ func (srv *Server) synod_attempt(propVal *LogEvent, LogIndex int) {
 						if v.PrepareNumber > nackMaxPrepare {
 							nackMaxPrepare = v.PrepareNumber
 						}
+						// proposer_record.maxPropNum: the proposal number for the current round
+						if proposer_record.maxPropNum < nackMaxPrepare {
+							proposer_record.maxPropNum = proposer_record.maxPropNum +
+								((nackMaxPrepare-proposer_record.maxPropNum+len(srv.peers)-1)/len(srv.peers))*len(srv.peers)
+							// maxPropNum = ceil((nackMaxPrepare - maxPropNum)/N) * N + maxPropNum
+						}
+
+						srv.px.gmtx.Lock()
+						srv.px.proposer_records[LogIndex] = proposer_record
+						srv.dump_stable_state()
+						srv.px.gmtx.Unlock()
+
 						numNacks[msg.SenderID] = true
 						if len(numNacks)*2 > len(srv.peers) {
 							goto afterPhase1
@@ -662,7 +746,7 @@ func (srv *Server) synod_attempt(propVal *LogEvent, LogIndex int) {
 			}
 		}
 	afterPhase1:
-		if len(numPromises)*2 <= len(srv.peers) {
+		if !canSkipP1 && len(numPromises)*2 <= len(srv.peers) {
 			goto afterPhase2
 		}
 		if acceptorAccVal == nil {
@@ -707,6 +791,17 @@ func (srv *Server) synod_attempt(propVal *LogEvent, LogIndex int) {
 						if v.PrepareNumber > nackMaxPrepare {
 							nackMaxPrepare = v.PrepareNumber
 						}
+						// proposer_record.maxPropNum: the proposal number for the current round
+						if proposer_record.maxPropNum < nackMaxPrepare {
+							proposer_record.maxPropNum = proposer_record.maxPropNum +
+								((nackMaxPrepare-proposer_record.maxPropNum+len(srv.peers)-1)/len(srv.peers))*len(srv.peers)
+							// maxPropNum = ceil((nackMaxPrepare - maxPropNum)/N) * N + maxPropNum
+						}
+
+						srv.px.gmtx.Lock()
+						srv.px.proposer_records[LogIndex] = proposer_record
+						srv.dump_stable_state()
+						srv.px.gmtx.Unlock()
 						if len(numNacks)*2 > len(srv.peers) {
 							goto afterPhase2
 						}
@@ -720,20 +815,17 @@ func (srv *Server) synod_attempt(propVal *LogEvent, LogIndex int) {
 		}
 
 	afterPhase2:
+		if currentRoundProposalNum+len(srv.peers) > proposer_record.maxPropNum {
+			proposer_record.maxPropNum = currentRoundProposalNum + len(srv.peers)
+			srv.px.gmtx.Lock()
+			srv.px.proposer_records[LogIndex] = proposer_record
+			srv.dump_stable_state()
+			srv.px.gmtx.Unlock()
+		}
+
 		if len(numAcknowledges)*2 > len(srv.peers) {
 			break
 		}
-
-		proposer_record.maxPropNum += len(srv.peers)
-		// proposer_record.maxPropNum: the proposal number for the current round
-		if proposer_record.maxPropNum < nackMaxPrepare {
-			proposer_record.maxPropNum = proposer_record.maxPropNum +
-				((nackMaxPrepare-proposer_record.maxPropNum+len(srv.peers)-1)/len(srv.peers))*len(srv.peers)
-			// maxPropNum = ceil((nackMaxPrepare - maxPropNum)/N) * N + maxPropNum
-		}
-		srv.px.gmtx.Lock()
-		srv.px.proposer_records[LogIndex] = proposer_record
-		srv.px.gmtx.Unlock()
 	}
 
 	srv.px.mlbx_mtx.Lock()
@@ -1100,6 +1192,7 @@ func main() {
 	gob.Register(PromiseMessage{})
 	gob.Register(NackMessage{})
 	gob.Register(LogEvent{})
+	gob.Register(StableState{})
 
 	if len(args) != 2 {
 		log.Fatal("USAGE: ./main <site_id>")
