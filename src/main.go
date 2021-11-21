@@ -580,6 +580,11 @@ func (srv *Server) learner_loop() {
 	}
 }
 
+func (srv *Server) can_skip_phase_1(LogIndex int) bool {
+	mjr := srv.px.learner_records.getMajority(LogIndex - 1)
+	return (mjr != nil && mjr.Proposer_id == srv.site_id)
+}
+
 func (srv *Server) synod_attempt(propVal *LogEvent, LogIndex int) {
 	srv.px.mlbx_mtx.Lock()
 	if _, mlbxExists := srv.px.proposer_mlbx[LogIndex]; !mlbxExists {
@@ -591,6 +596,7 @@ func (srv *Server) synod_attempt(propVal *LogEvent, LogIndex int) {
 
 	mlbx := srv.px.proposer_mlbx[LogIndex]
 	srv.px.mlbx_mtx.Unlock()
+
 	srv.px.gmtx.Lock()
 	if _, propExists := srv.px.proposer_records[LogIndex]; !propExists {
 		srv.px.proposer_records[LogIndex] = *dflProposer(srv.site_ord)
@@ -602,15 +608,13 @@ func (srv *Server) synod_attempt(propVal *LogEvent, LogIndex int) {
 	for tries := 0; tries < max_tries; tries += 1 {
 
 		srv.px.gmtx.Lock()
-		proposer_record.maxPropNum += len(srv.peers)
-
-		// proposer_record.maxPropNum: the proposal number for the current round
-		srv.px.proposer_records[LogIndex] = proposer_record
-
+		// canSkipP1 := srv.can_skip_phase_1(LogIndex) && srv.px.proposer_records[LogIndex].maxPropNum == srv.site_ord
+		prepareMsg := proposer_record.create_prepare_message()
+		currentRoundProposalNum := prepareMsg.ProposalNumber
 		prepareWrap := &Message{
 			LogIndex: LogIndex,
 			SenderID: srv.site_id,
-			Contents: proposer_record.create_prepare_message()}
+			Contents: prepareMsg}
 		srv.px.gmtx.Unlock()
 
 		srv.send_all(prepareWrap)
@@ -621,14 +625,15 @@ func (srv *Server) synod_attempt(propVal *LogEvent, LogIndex int) {
 		var acceptMsgWrap *Message
 		var acceptMsg *AcceptMessage
 		var acceptorAccVal *LogEvent = nil
+		var timer <-chan time.Time
 		maxAcceptorAccNum := -1
-		timer := time.After(synod_timeout)
+		timer = time.After(synod_timeout)
 		for {
 			select {
 			case msg := <-mlbx:
 				switch v := msg.Contents.(type) {
 				case PromiseMessage:
-					if v.ProposalNumber == proposer_record.maxPropNum {
+					if v.ProposalNumber == currentRoundProposalNum {
 						numPromises[msg.SenderID] = true
 						if !v.IsNull && v.AcceptNum > maxAcceptorAccNum {
 							maxAcceptorAccNum = v.AcceptNum
@@ -639,7 +644,7 @@ func (srv *Server) synod_attempt(propVal *LogEvent, LogIndex int) {
 						}
 					}
 				case NackMessage:
-					if v.ProposalNumber == proposer_record.maxPropNum {
+					if v.ProposalNumber == currentRoundProposalNum {
 						if v.PrepareNumber > nackMaxPrepare {
 							nackMaxPrepare = v.PrepareNumber
 						}
@@ -666,11 +671,11 @@ func (srv *Server) synod_attempt(propVal *LogEvent, LogIndex int) {
 				goto afterPhase2
 			}
 			acceptMsg = &AcceptMessage{
-				ProposalNumber: proposer_record.maxPropNum,
+				ProposalNumber: currentRoundProposalNum,
 				ProposalVal:    *propVal}
 		} else {
 			acceptMsg = &AcceptMessage{
-				ProposalNumber: proposer_record.maxPropNum,
+				ProposalNumber: currentRoundProposalNum,
 				ProposalVal:    *acceptorAccVal}
 		}
 		acceptMsgWrap = &Message{
@@ -690,14 +695,14 @@ func (srv *Server) synod_attempt(propVal *LogEvent, LogIndex int) {
 			case msg := <-mlbx:
 				switch v := msg.Contents.(type) {
 				case AcknowledgeMessage:
-					if v.ProposalNumber == proposer_record.maxPropNum {
+					if v.ProposalNumber == currentRoundProposalNum {
 						numAcknowledges[msg.SenderID] = true
 						if len(numAcknowledges)*2 > len(srv.peers) {
 							goto afterPhase2
 						}
 					}
 				case NackMessage:
-					if v.ProposalNumber == proposer_record.maxPropNum {
+					if v.ProposalNumber == currentRoundProposalNum {
 						numNacks[msg.SenderID] = true
 						if v.PrepareNumber > nackMaxPrepare {
 							nackMaxPrepare = v.PrepareNumber
@@ -718,11 +723,17 @@ func (srv *Server) synod_attempt(propVal *LogEvent, LogIndex int) {
 		if len(numAcknowledges)*2 > len(srv.peers) {
 			break
 		}
+
+		proposer_record.maxPropNum += len(srv.peers)
+		// proposer_record.maxPropNum: the proposal number for the current round
 		if proposer_record.maxPropNum < nackMaxPrepare {
 			proposer_record.maxPropNum = proposer_record.maxPropNum +
 				((nackMaxPrepare-proposer_record.maxPropNum+len(srv.peers)-1)/len(srv.peers))*len(srv.peers)
 			// maxPropNum = ceil((nackMaxPrepare - maxPropNum)/N) * N + maxPropNum
 		}
+		srv.px.gmtx.Lock()
+		srv.px.proposer_records[LogIndex] = proposer_record
+		srv.px.gmtx.Unlock()
 	}
 
 	srv.px.mlbx_mtx.Lock()
