@@ -265,8 +265,10 @@ func read_stable_state() *StableState {
 	var store StableState
 	storage_file, err := os.Open(stable_path)
 	if err != nil {
-		log.Printf("read_stable_state: file %s open error: %v\n",
-			stable_path, err)
+		if err != io.EOF {
+			log.Printf("read_stable_state: file %s open error: %v\n",
+				stable_path, err)
+		}
 		return nil
 	}
 	dec := gob.NewDecoder(storage_file)
