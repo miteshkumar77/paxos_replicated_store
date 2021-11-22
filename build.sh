@@ -14,4 +14,4 @@ touch stable_storage.txt
 ls
 cp main ./bin/
 cp run.sh ./bin/
-cp stable_storage.json ./bin/
+cp stable_storage.txt ./bin/
