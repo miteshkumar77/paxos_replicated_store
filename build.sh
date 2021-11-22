@@ -10,7 +10,7 @@ echo $golocation
 
 $golocation build -o main ./src/main.go
 
-touch stable_storage.json
+touch stable_storage.txt
 ls
 cp main ./bin/
 cp run.sh ./bin/
