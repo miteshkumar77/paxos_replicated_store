@@ -21,6 +21,8 @@ import (
 
 const stable_path = "stable_storage.txt"
 
+// Maximum number of proposal
+// tries before declaring temporary failure
 const max_tries = 3
 
 const synod_timeout = time.Millisecond * 200
@@ -29,6 +31,7 @@ const synod_timeout = time.Millisecond * 200
 
 const max_pkt_size = 65507
 
+// For channel non-blocking
 const channel_capacity = 10000
 
 func proposer_addr(node Node) *net.UDPAddr {
@@ -79,6 +82,7 @@ func send_msg_to_addr(msg *Message, addr *net.UDPAddr) {
 	// }(*msg, addr)
 }
 
+// Receive helper
 func recv_from_conn(conn *net.UDPConn) *Message {
 	data := make([]byte, max_pkt_size)
 	_, _, err := conn.ReadFromUDP(data)
@@ -107,6 +111,7 @@ var item_names = [4]string{
 	"toilet paper rolls",
 	"reeses peanut butter cups"}
 
+// Initial inventory
 var original_amounts = [4]int{500, 100, 200, 200}
 
 // Node is a struct used for unmarshalling networking
@@ -134,6 +139,7 @@ const (
 	Cancel
 )
 
+// Data stored within a single log slot
 type LogEvent struct {
 	OpCode      OpCodeType `json:"op_code"`
 	Name        string     `json:"name"`
@@ -141,6 +147,10 @@ type LogEvent struct {
 	Proposer_id string     `json:"proposer_id"`
 }
 
+// Message represents messages sent by the paxos algorithm
+// Contents interface{} can be specialized to separate forms
+// but all messages contain the LogIndex that they pertain to,
+// and the id of the sender.
 type Message struct {
 	LogIndex int    `json:"log_index"`
 	SenderID string `json:"sender_id"`
@@ -178,10 +188,14 @@ type AcknowledgeMessage struct {
 	ProposalNumber int `json:"accept_num"`
 }
 
+// Proposer state for a single LogIndex,
+// is saved to stable storage.
 type Proposer struct {
 	MaxPropNum int
 }
 
+// Acceptor state for a single LogIndex,
+// is saved to stable storage.
 type Acceptor struct {
 	MaxPrepare int
 	IsNull     bool
@@ -189,30 +203,56 @@ type Acceptor struct {
 	AcceptVal  LogEvent
 }
 
+// Learner state for all log indices,
+// is saved to stable storage.
 type Learner struct {
-	Log             map[int]map[string]LogEvent
-	Committed       map[int]LogEvent
-	LogSize         int
+	// Each log slot is a map of the proposal number to
+	// a map of the values accepted by acceptors for that proposal
+	// number
+	Log map[int]map[int]map[string]LogEvent
+
+	// We cache the majority in Committed so that we don't have
+	// to recompute it, since it does not change.
+	Committed map[int]LogEvent
+
+	// Number of committed entries in the log.
+	LogSize int
+
+	// Highest committed log index, is used to detect holes
 	HighestLogIndex int
-	NumPeers        int
+
+	// Number of peers, is used to detect majority
+	NumPeers int
 }
 
+// Paxos state for all log indices
 type Paxos struct {
+	// LogIndex -> Proposer State
 	proposer_records map[int]Proposer
+
+	// LogIndex -> Learner State
 	acceptor_records map[int]Acceptor
 	learner_records  Learner
 	inventoryAmounts [4]int
-	proposer_mlbx    map[int]chan Message
-	mlbx_mtx         sync.Mutex
-	gmtx             sync.Mutex
+
+	// LogIndex -> Mailbox of messages pertaining to a particular log slot
+	proposer_mlbx map[int]chan Message
+
+	mlbx_mtx sync.Mutex
+	gmtx     sync.Mutex
 }
 
+// State that we intend to save to stable storage
+// and recover using.
 type StableState struct {
 	Proposer_records map[int]Proposer
 	Acceptor_records map[int]Acceptor
 	Learner_records  Learner
 }
 
+// The Server state encapsulates all paxos state, peer
+// addressing information, synchronization mechanisms,
+// user interface, and paxos algorithm subroutines.
 type Server struct {
 	site_id       string
 	peers         map[string]Node
@@ -224,10 +264,12 @@ type Server struct {
 	site_ord      int
 }
 
+// Create a new default proposer state object
 func dflProposer(site_ord int) *Proposer {
 	return &Proposer{MaxPropNum: site_ord}
 }
 
+// Create a new default acceptor state object
 func dflAcceptor() *Acceptor {
 	return &Acceptor{
 		MaxPrepare: 0,
@@ -236,6 +278,8 @@ func dflAcceptor() *Acceptor {
 		AcceptVal:  LogEvent{OpCode: Cancel, Name: "", Amounts: [4]int{-1. - 1. - 1. - 1}, Proposer_id: ""}}
 }
 
+// Serialize all stable state of the server to a
+// file using the 'gob' go binary format.
 func (srv *Server) dump_stable_state() {
 	store := StableState{
 		Proposer_records: srv.px.proposer_records,
@@ -261,6 +305,9 @@ func (srv *Server) dump_stable_state() {
 	}
 }
 
+// Read contents of stable storage file into
+// StableState, and return a pointer to it if successful,
+// otherwise return nil.
 func read_stable_state() *StableState {
 	var store StableState
 	storage_file, err := os.Open(stable_path)
@@ -286,6 +333,10 @@ func read_stable_state() *StableState {
 	return &store
 }
 
+// Find the majority accepted LogEvent object for a particular log index
+// and return a pointer to it, or return nil if no majority exists
+// this is equivalent to returning the 'chosen' value at a particular
+// log index
 func (l *Learner) getMajority(LogIndex int) *LogEvent {
 	log_slot, ok := l.Log[LogIndex]
 	if !ok {
@@ -296,39 +347,40 @@ func (l *Learner) getMajority(LogIndex int) *LogEvent {
 		return &mjr
 	}
 
-	var majority_ev *LogEvent = nil
-	majority_ev_str := ""
-	majority_freq := 0
-
-	for _, ev := range log_slot {
-		ev_str := ev.logEventStr()
-		if ev_str == majority_ev_str {
-			majority_freq++
-		} else {
-			majority_freq--
-			if majority_freq <= 0 {
-				majority_freq = 1
-				majority_ev = &ev
-				majority_ev_str = ev_str
+	for _, prop_accs := range log_slot {
+		var majority_ev *LogEvent = nil
+		majority_ev_str := ""
+		majority_freq := 0
+		for _, ev := range prop_accs {
+			ev_str := ev.logEventStr()
+			if ev_str == majority_ev_str {
+				majority_freq++
+			} else {
+				majority_freq--
+				if majority_freq <= 0 {
+					majority_freq = 1
+					majority_ev = &ev
+					majority_ev_str = ev_str
+				}
 			}
 		}
-	}
 
-	ct := 0
-	for _, ev := range log_slot {
-		ev_str := ev.logEventStr()
-		if ev_str == majority_ev_str {
-			ct++
+		ct := 0
+		for _, ev := range prop_accs {
+			ev_str := ev.logEventStr()
+			if ev_str == majority_ev_str {
+				ct++
+			}
+		}
+		if ct*2 > l.NumPeers {
+			l.Committed[LogIndex] = *majority_ev
+			return majority_ev
 		}
 	}
-	if ct*2 > l.NumPeers {
-		l.Committed[LogIndex] = *majority_ev
-		return majority_ev
-	} else {
-		return nil
-	}
+	return nil
 }
 
+// Create a copy of the default inventory amounts
 func dfl_inventory() [4]int {
 	return [4]int{original_amounts[0],
 		original_amounts[1],
@@ -336,6 +388,8 @@ func dfl_inventory() [4]int {
 		original_amounts[3]}
 }
 
+// Calculate the inventory amounts based on the filled entries
+// in the log of a stable state object. Used in recovery.
 func calc_inventory(stable_state *StableState) [4]int {
 	ret := dfl_inventory()
 	for lindex := 0; lindex <= stable_state.Learner_records.HighestLogIndex; lindex++ {
@@ -353,15 +407,17 @@ func calc_inventory(stable_state *StableState) [4]int {
 	return ret
 }
 
+// Create a brand new learner object (if loading from stable storage failed).
 func newLearner(numPeers int) *Learner {
 	return &Learner{
-		Log:             make(map[int]map[string]LogEvent),
+		Log:             make(map[int]map[int]map[string]LogEvent),
 		Committed:       make(map[int]LogEvent),
 		LogSize:         0,
 		HighestLogIndex: -1,
 		NumPeers:        numPeers}
 }
 
+// Create a new paxos object, instantiate using stable state if possible.
 func newPaxos(numPeers int) *Paxos {
 	stable_state := read_stable_state()
 	if stable_state == nil {
@@ -382,8 +438,10 @@ func newPaxos(numPeers int) *Paxos {
 		gmtx:             sync.Mutex{}}
 }
 
+// Create a new server
 func newServer(own_site_id string, peers Map) *Server {
 	site_ord := 0
+
 	site_id_arr := make([]string, 0)
 	for peer_site_id := range peers.Hosts {
 		site_id_arr = append(site_id_arr, peer_site_id)
@@ -413,6 +471,9 @@ func newServer(own_site_id string, peers Map) *Server {
 	return &s
 }
 
+// Helper function to send a message to all peers
+// by utilizing a passed in addr_fn function used to translate
+// a site to its address (depending on if we want to send to acceptors or learners of that site)
 func send_all_helper(msg *Message, recipients *map[string]Node, addr_fn func(Node) *net.UDPAddr) {
 	for site_id, node := range *recipients {
 		fmt.Fprintf(os.Stderr, "sending %s to %s addr: %s\n", msg.messageStr(), site_id,
@@ -421,6 +482,11 @@ func send_all_helper(msg *Message, recipients *map[string]Node, addr_fn func(Nod
 	}
 }
 
+// method to send a message to all peers.
+// sends prepare messages to all acceptors
+//       accept message to all acceptors
+//       accepted message to all learners
+// fails for any other type of message
 func (srv *Server) send_all(msg *Message) {
 	switch (*msg).Contents.(type) {
 	case PrepareMessage:
@@ -434,6 +500,9 @@ func (srv *Server) send_all(msg *Message) {
 	}
 }
 
+// method to send a message to one proposer at site site_id
+// sends promise message, acknowledge message, nack message
+// fails for any other type of message
 func (srv *Server) send_to_id(msg *Message, site_id string) {
 	var addr *net.UDPAddr
 	switch msg.Contents.(type) {
@@ -452,11 +521,14 @@ func (srv *Server) send_to_id(msg *Message, site_id string) {
 	send_msg_to_addr(msg, addr)
 }
 
+// Create a prepare message based on a proposer's current MaxPropNum.
 func (prop *Proposer) create_prepare_message() PrepareMessage {
 	return PrepareMessage{
 		ProposalNumber: prop.MaxPropNum}
 }
 
+// Create a promise message based on the acceptor's current state and a
+// prepare number of the current round.
 func (acc *Acceptor) create_promise_message(PrepareNumber int) PromiseMessage {
 	return PromiseMessage{
 		IsNull:         acc.IsNull,
@@ -465,6 +537,8 @@ func (acc *Acceptor) create_promise_message(PrepareNumber int) PromiseMessage {
 		AcceptVal:      acc.AcceptVal}
 }
 
+// Create an accepted message based on the acceptor's current state
+// throws an error if the acceptor hasn't yet accepted a value.
 func (acc *Acceptor) create_accepted_message() AcceptedMessage {
 	if acc.IsNull {
 		log.Fatalf("create_accepted_message: acc is null")
@@ -474,10 +548,13 @@ func (acc *Acceptor) create_accepted_message() AcceptedMessage {
 		AcceptVal: acc.AcceptVal}
 }
 
-// Acceptor
+// Acceptor: handle a prepare message for a particular log index
 func (srv *Server) handle_prepare(LogIndex int, SenderID string,
 	prepareMsg PrepareMessage) {
 	srv.px.gmtx.Lock()
+
+	// If there isn't an acceptor record for this particular
+	// prepare message yet, then create one.
 	if _, ok := srv.px.acceptor_records[LogIndex]; !ok {
 		srv.px.acceptor_records[LogIndex] = *dflAcceptor()
 	}
@@ -492,6 +569,13 @@ func (srv *Server) handle_prepare(LogIndex int, SenderID string,
 			SenderID: srv.site_id,
 			Contents: acceptor.create_promise_message(prepareMsg.ProposalNumber),
 		}
+
+		// Only need to dump stable state if a change to
+		// acceptor's state was made. Do this before sending.
+		//
+		// The algorithm can handle message loss, so if we crash
+		// before the message was sent, then it can be treated as if
+		// the prepare message was lost.
 		srv.dump_stable_state()
 		srv.send_to_id(promiseMessageWrap, SenderID)
 	} else {
@@ -507,16 +591,39 @@ func (srv *Server) handle_prepare(LogIndex int, SenderID string,
 	srv.px.gmtx.Unlock()
 }
 
-// Acceptor
+// Acceptor: handle an accept message for a particular log index.
 func (srv *Server) handle_accept(LogIndex int, SenderID string,
 	acceptMsg AcceptMessage) {
 	srv.px.gmtx.Lock()
 
+	// If there isn't an acceptor record for this particular
+	// prepare message yet, then create one.
+	//
+	// This is necessary even for handle_accept because an acceptor
+	// didn't have to send a prepare in order to get an accept message
+	// I.e. the proposer only needed promises from a majority.
+	if _, ok := srv.px.acceptor_records[LogIndex]; !ok {
+		srv.px.acceptor_records[LogIndex] = *dflAcceptor()
+	}
+
 	acceptor := srv.px.acceptor_records[LogIndex]
-	prevMjr := srv.px.learner_records.getMajority(LogIndex - 1)
-	canAccept := acceptMsg.ProposalNumber >= acceptor.MaxPrepare &&
-		((acceptMsg.ProposalNumber != 0) ||
-			(prevMjr == nil || prevMjr.Proposer_id == SenderID))
+
+	// TWO POSSIBILITIES, not sure which one is better.
+
+	// We can accept this proposed value if
+	// ProposalNumber >= MaxPrepare and
+	// if the ProposalNumber was 0 then
+	//    the previous majority the previous majority must be known
+	//    and was proposed by the same site
+	// prevMjr := srv.px.learner_records.getMajority(LogIndex - 1)
+	// canAccept := acceptMsg.ProposalNumber >= acceptor.MaxPrepare &&
+	// 	((acceptMsg.ProposalNumber != 0) ||
+	// 		(prevMjr != nil || prevMjr.Proposer_id == SenderID))
+
+	// We can accept this proposed value if
+	// ProposalNumber >= MaxPrepare
+	canAccept := acceptMsg.ProposalNumber >= acceptor.MaxPrepare
+
 	if canAccept {
 		acceptor.IsNull = false
 		acceptor.MaxPrepare = acceptMsg.ProposalNumber
@@ -532,8 +639,10 @@ func (srv *Server) handle_accept(LogIndex int, SenderID string,
 			SenderID: srv.site_id,
 			Contents: AcknowledgeMessage{ProposalNumber: acceptMsg.ProposalNumber}}
 
+		// dump to stable storage only if change to state was made
+		// we should save before sending a message in order to ensure
+		// correctness.
 		srv.dump_stable_state()
-
 		srv.send_to_id(acknowledgeMessageWrap, SenderID)
 		srv.send_all(acceptedMessageWrap)
 	} else {
@@ -548,6 +657,9 @@ func (srv *Server) handle_accept(LogIndex int, SenderID string,
 	srv.px.gmtx.Unlock()
 }
 
+// acceptor loop runs on its own thread,
+// receives messages from other peers and
+// trigger message handlers.
 func (srv *Server) acceptor_loop() {
 	for {
 		msg := <-srv.acceptor_chan
@@ -564,6 +676,9 @@ func (srv *Server) acceptor_loop() {
 	}
 }
 
+// Return string to print out when a learner
+// a log index that came from the proposer on the same
+// site id as itself.
 func on_learned_str(ev *LogEvent) string {
 	switch ev.OpCode {
 	case Order:
@@ -577,6 +692,7 @@ func on_learned_str(ev *LogEvent) string {
 }
 
 // To be used with gmtx acquired
+// get the corresponding order event of a particular cancel log event that is to be added
 func (srv *Server) get_corresponding_order(ev *LogEvent) *LogEvent {
 	if ev.OpCode != Cancel {
 		log.Fatalf("get_corresponding_order: invalid OpCode\n")
@@ -629,19 +745,27 @@ func (srv *Server) apply_log_event(ev *LogEvent) {
 	}
 }
 
-// Learner
+// Learner: handle an accepted message from an acceptor
 func (srv *Server) handle_accepted(LogIndex int, SenderID string,
 	acceptedMsg AcceptedMessage) {
 	srv.px.gmtx.Lock()
+
+	// Create a default acceptor log entry for this slot, if one does not exist.
 	if _, slot_exists := srv.px.learner_records.Log[LogIndex]; !slot_exists {
-		srv.px.learner_records.Log[LogIndex] = make(map[string]LogEvent)
+		srv.px.learner_records.Log[LogIndex] = make(map[int]map[string]LogEvent)
 	}
-	// if _, accept_exists := srv.px.learner_records.log[LogIndex][SenderID]; !accept_exists {
+
+	if _, prop_exists := srv.px.learner_records.Log[LogIndex][acceptedMsg.AcceptNum]; !prop_exists {
+		srv.px.learner_records.Log[LogIndex][acceptedMsg.AcceptNum] = make(map[string]LogEvent)
+	}
+
+	// Get the majority before applying accepted message
 	majorityBefore := srv.px.learner_records.getMajority(LogIndex)
-	srv.px.learner_records.Log[LogIndex][SenderID] = acceptedMsg.AcceptVal
+	srv.px.learner_records.Log[LogIndex][acceptedMsg.AcceptNum][SenderID] = acceptedMsg.AcceptVal
+
+	// Majority after applying accepted message
 	majorityAfter := srv.px.learner_records.getMajority(LogIndex)
 	if majorityBefore == nil {
-
 		if majorityAfter != nil {
 			srv.apply_log_event(&acceptedMsg.AcceptVal)
 			srv.px.learner_records.LogSize++
@@ -658,7 +782,6 @@ func (srv *Server) handle_accepted(LogIndex int, SenderID string,
 			log.Fatal("handle_accepted: learned value changed!!!")
 		}
 	}
-	// }
 	srv.px.gmtx.Unlock()
 }
 
@@ -676,11 +799,14 @@ func (srv *Server) learner_loop() {
 	}
 }
 
+// Check if the current site was the proposer of the previous log slot
+// majority.
 func (srv *Server) can_skip_phase_1(LogIndex int) bool {
 	mjr := srv.px.learner_records.getMajority(LogIndex - 1)
 	return (mjr != nil && mjr.Proposer_id == srv.site_id)
 }
 
+// proposer phase1/phase2 algorithm for synod
 func (srv *Server) synod_attempt(propVal *LogEvent, LogIndex int) {
 	srv.px.mlbx_mtx.Lock()
 	if _, mlbxExists := srv.px.proposer_mlbx[LogIndex]; !mlbxExists {
