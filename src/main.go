@@ -34,6 +34,15 @@ const max_pkt_size = 65507
 // For channel non-blocking
 const channel_capacity = 10000
 
+func next_highest_prop_num(num int, site_ord int, n_peers int) int {
+	num_mod := num - num%n_peers
+	ans := num_mod + site_ord
+	for ans < num {
+		ans += site_ord
+	}
+	return ans
+}
+
 func proposer_addr(node Node) *net.UDPAddr {
 	return &net.UDPAddr{
 		Port: node.UdpStartPort,
@@ -158,7 +167,12 @@ type Message struct {
 	Contents interface{} `json:"contents"`
 }
 
-type NackMessage struct {
+type NackPrepareMessage struct {
+	PrepareNumber  int `json:"prepare_number"`
+	ProposalNumber int `json:"proposal_number"`
+}
+
+type NackAcceptMessage struct {
 	PrepareNumber  int `json:"prepare_number"`
 	ProposalNumber int `json:"proposal_number"`
 }
@@ -265,8 +279,8 @@ type Server struct {
 }
 
 // Create a new default proposer state object
-func dflProposer(site_ord int) *Proposer {
-	return &Proposer{MaxPropNum: site_ord}
+func dflProposer(site_ord int, n_peers int) *Proposer {
+	return &Proposer{MaxPropNum: site_ord + n_peers}
 }
 
 // Create a new default acceptor state object
@@ -453,7 +467,7 @@ func newServer(own_site_id string, peers Map) *Server {
 
 	for idx, peer_site_id := range site_id_arr {
 		if peer_site_id == own_site_id {
-			site_ord = idx + 1
+			site_ord = idx
 			break
 		}
 	}
@@ -510,7 +524,9 @@ func (srv *Server) send_to_id(msg *Message, site_id string) {
 		addr = proposer_addr(srv.peers[site_id])
 	case AcknowledgeMessage:
 		addr = proposer_addr(srv.peers[site_id])
-	case NackMessage:
+	case NackPrepareMessage:
+		addr = proposer_addr(srv.peers[site_id])
+	case NackAcceptMessage:
 		addr = proposer_addr(srv.peers[site_id])
 	default:
 		log.Fatalf("send_to_id: Invalid Message Format\n")
@@ -582,7 +598,7 @@ func (srv *Server) handle_prepare(LogIndex int, SenderID string,
 		nackMessageWrap := &Message{
 			LogIndex: LogIndex,
 			SenderID: srv.site_id,
-			Contents: NackMessage{
+			Contents: NackPrepareMessage{
 				ProposalNumber: prepareMsg.ProposalNumber,
 				PrepareNumber:  acceptor.MaxPrepare}}
 		srv.send_to_id(nackMessageWrap, SenderID)
@@ -649,7 +665,7 @@ func (srv *Server) handle_accept(LogIndex int, SenderID string,
 		nackMessageWrap := &Message{
 			LogIndex: LogIndex,
 			SenderID: srv.site_id,
-			Contents: NackMessage{
+			Contents: NackAcceptMessage{
 				ProposalNumber: acceptMsg.ProposalNumber,
 				PrepareNumber:  acceptor.MaxPrepare}}
 		srv.send_to_id(nackMessageWrap, SenderID)
@@ -803,10 +819,13 @@ func (srv *Server) learner_loop() {
 // majority.
 func (srv *Server) can_skip_phase_1(LogIndex int) bool {
 	mjr := srv.px.learner_records.getMajority(LogIndex - 1)
-	return (mjr != nil && mjr.Proposer_id == srv.site_id)
+	return (mjr != nil && mjr.Proposer_id == srv.site_id) &&
+		srv.px.proposer_records[LogIndex].MaxPropNum == (srv.site_ord+len(srv.peers))
 }
 
-// proposer phase1/phase2 algorithm for synod
+// proposer phase1/phase2 algorithm for synod, can run multiple
+// synods in parallel as long as no two simultaneous runs are for the same
+// log slot
 func (srv *Server) synod_attempt(propVal *LogEvent, LogIndex int) {
 	srv.px.mlbx_mtx.Lock()
 	if _, mlbxExists := srv.px.proposer_mlbx[LogIndex]; !mlbxExists {
@@ -816,41 +835,73 @@ func (srv *Server) synod_attempt(propVal *LogEvent, LogIndex int) {
 		return
 	}
 
+	// mlbx only exists for the duration of synod_attempt function execution
+	// and is deleted at the end.
 	mlbx := srv.px.proposer_mlbx[LogIndex]
 	srv.px.mlbx_mtx.Unlock()
 
 	srv.px.gmtx.Lock()
 	if _, propExists := srv.px.proposer_records[LogIndex]; !propExists {
-		srv.px.proposer_records[LogIndex] = *dflProposer(srv.site_ord)
+		srv.px.proposer_records[LogIndex] = *dflProposer(srv.site_ord, len(srv.peers))
 	}
 	proposer_record := srv.px.proposer_records[LogIndex]
 	srv.px.gmtx.Unlock()
+
+	// maximum prepare number we have seen from a nack message
 	nackMaxPrepare := 0
 
 	for tries := 0; tries < max_tries; tries += 1 {
 
 		srv.px.gmtx.Lock()
-		canSkipP1 := srv.can_skip_phase_1(LogIndex) && tries == 0 &&
-			srv.px.proposer_records[LogIndex].MaxPropNum == srv.site_ord
+		// we can skip phase 1 if we won the last log entry and this is the
+		// site's first prepare message
+		canSkipP1 := srv.can_skip_phase_1(LogIndex)
 		prepareMsg := proposer_record.create_prepare_message()
+
+		// the proposal number to be used in the current round
 		currentRoundProposalNum := prepareMsg.ProposalNumber
+
+		// If we can skip the prepare phase, then we use proposal number 0.
+		// This is to ensure that we cannot overwite any other site's
+		// accept message.
 		if canSkipP1 {
 			currentRoundProposalNum = 0
 		}
+
+		// This prepare message only gets sent if we aren't skipping the prepare
+		// phase (i.e. if currentRoundProposalNum =/= 0).
 		prepareWrap := &Message{
 			LogIndex: LogIndex,
 			SenderID: srv.site_id,
 			Contents: prepareMsg}
 		srv.px.gmtx.Unlock()
 
+		// set of all site ids from whom we've received
+		// a promise message with ProposalNumber equal to
+		// currentRoundProposalNum. Used in phase 1.
 		numPromises := make(map[string]bool)
-		numNacks := make(map[string]bool)
+
+		// set of all site ids from whom we've received
+		// a promiseNack message with ProposalNumber equal to
+		// currentRoundProposalNum. Used in phase 1.
+		numPromiseNacks := make(map[string]bool)
+
+		// set of all site ids from whom we've received
+		// an acceptNack message with ProposalNumber equal to
+		// currentRoundProposalNum. Used in phase 2.
+		numAcceptNacks := make(map[string]bool)
+
+		// set of all site ids from whom we've received
+		// an acknowledge message with ProposalNumber equal to
+		// currentRoundProposalNum. Used in phase 2.
 		numAcknowledges := make(map[string]bool)
+
 		var acceptMsgWrap *Message
 		var acceptMsg *AcceptMessage
 		var acceptorAccVal *LogEvent = nil
 		var timer <-chan time.Time
 		maxAcceptorAccNum := -1
+
 		if canSkipP1 {
 			goto afterPhase1
 		}
@@ -871,7 +922,7 @@ func (srv *Server) synod_attempt(propVal *LogEvent, LogIndex int) {
 							goto afterPhase1
 						}
 					}
-				case NackMessage:
+				case NackPrepareMessage:
 					if v.ProposalNumber == currentRoundProposalNum {
 						if v.PrepareNumber > nackMaxPrepare {
 							nackMaxPrepare = v.PrepareNumber
@@ -883,13 +934,8 @@ func (srv *Server) synod_attempt(propVal *LogEvent, LogIndex int) {
 							// maxPropNum = ceil((nackMaxPrepare - maxPropNum)/N) * N + maxPropNum
 						}
 
-						srv.px.gmtx.Lock()
-						srv.px.proposer_records[LogIndex] = proposer_record
-						srv.dump_stable_state()
-						srv.px.gmtx.Unlock()
-
-						numNacks[msg.SenderID] = true
-						if len(numNacks)*2 > len(srv.peers) {
+						numPromiseNacks[msg.SenderID] = true
+						if len(numPromiseNacks)*2 > len(srv.peers) {
 							goto afterPhase1
 						}
 					}
@@ -923,9 +969,10 @@ func (srv *Server) synod_attempt(propVal *LogEvent, LogIndex int) {
 			SenderID: srv.site_id,
 			Contents: *acceptMsg}
 
-		for k := range numNacks {
-			delete(numNacks, k)
-		}
+		srv.px.gmtx.Lock()
+		srv.px.proposer_records[LogIndex] = proposer_record
+		srv.dump_stable_state()
+		srv.px.gmtx.Unlock()
 
 		srv.send_all(acceptMsgWrap)
 		timer = time.After(synod_timeout)
@@ -941,9 +988,9 @@ func (srv *Server) synod_attempt(propVal *LogEvent, LogIndex int) {
 							goto afterPhase2
 						}
 					}
-				case NackMessage:
+				case NackAcceptMessage:
 					if v.ProposalNumber == currentRoundProposalNum {
-						numNacks[msg.SenderID] = true
+						numAcceptNacks[msg.SenderID] = true
 						if v.PrepareNumber > nackMaxPrepare {
 							nackMaxPrepare = v.PrepareNumber
 						}
@@ -954,11 +1001,7 @@ func (srv *Server) synod_attempt(propVal *LogEvent, LogIndex int) {
 							// maxPropNum = ceil((nackMaxPrepare - maxPropNum)/N) * N + maxPropNum
 						}
 
-						srv.px.gmtx.Lock()
-						srv.px.proposer_records[LogIndex] = proposer_record
-						srv.dump_stable_state()
-						srv.px.gmtx.Unlock()
-						if len(numNacks)*2 > len(srv.peers) {
+						if len(numAcceptNacks)*2 > len(srv.peers) {
 							goto afterPhase2
 						}
 					}
@@ -973,11 +1016,12 @@ func (srv *Server) synod_attempt(propVal *LogEvent, LogIndex int) {
 	afterPhase2:
 		if currentRoundProposalNum+len(srv.peers) > proposer_record.MaxPropNum {
 			proposer_record.MaxPropNum = currentRoundProposalNum + len(srv.peers)
-			srv.px.gmtx.Lock()
-			srv.px.proposer_records[LogIndex] = proposer_record
-			srv.dump_stable_state()
-			srv.px.gmtx.Unlock()
 		}
+
+		srv.px.gmtx.Lock()
+		srv.px.proposer_records[LogIndex] = proposer_record
+		srv.dump_stable_state()
+		srv.px.gmtx.Unlock()
 
 		if len(numAcknowledges)*2 > len(srv.peers) {
 			break
@@ -1274,8 +1318,11 @@ func (msg *Message) messageStr() string {
 			v.AcceptVal.logEventStr())
 	case AcknowledgeMessage:
 		return fmt.Sprintf("ack[%d](%d)", msg.LogIndex, v.ProposalNumber)
-	case NackMessage:
-		return fmt.Sprintf("nack[%d](prepare_number: %d, proposal_number: %d)",
+	case NackPrepareMessage:
+		return fmt.Sprintf("nack_prepare[%d](prepare_number: %d, proposal_number: %d)",
+			msg.LogIndex, v.PrepareNumber, v.ProposalNumber)
+	case NackAcceptMessage:
+		return fmt.Sprintf("nack_accept[%d](prepare_number: %d, proposal_number: %d)",
 			msg.LogIndex, v.PrepareNumber, v.ProposalNumber)
 	default:
 		log.Fatal("messageStr: Invalid Message Format")
@@ -1346,7 +1393,8 @@ func main() {
 	gob.Register(AcceptMessage{})
 	gob.Register(AcceptedMessage{})
 	gob.Register(PromiseMessage{})
-	gob.Register(NackMessage{})
+	gob.Register(NackPrepareMessage{})
+	gob.Register(NackAcceptMessage{})
 
 	gob.Register(LogEvent{})
 
