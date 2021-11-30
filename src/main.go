@@ -34,14 +34,14 @@ const max_pkt_size = 65507
 // For channel non-blocking
 const channel_capacity = 10000
 
-func next_highest_prop_num(num int, site_ord int, n_peers int) int {
-	num_mod := num - num%n_peers
-	ans := num_mod + site_ord
-	for ans < num {
-		ans += site_ord
-	}
-	return ans
-}
+// func next_highest_prop_num(num int, site_ord int, n_peers int) int {
+// 	num_mod := num - num%n_peers
+// 	ans := num_mod + site_ord
+// 	for ans < num {
+// 		ans += site_ord
+// 	}
+// 	return ans
+// }
 
 func proposer_addr(node Node) *net.UDPAddr {
 	return &net.UDPAddr{
@@ -202,6 +202,14 @@ type AcknowledgeMessage struct {
 	ProposalNumber int `json:"accept_num"`
 }
 
+type RecoverMessage struct {
+}
+
+type AcceptedRelayMessage struct {
+	OriginalMessage AcceptedMessage `json:"original_message"`
+	OriginSite      string          `json:"origin_site"`
+}
+
 // Proposer state for a single LogIndex,
 // is saved to stable storage.
 type Proposer struct {
@@ -247,7 +255,6 @@ type Paxos struct {
 	// LogIndex -> Learner State
 	acceptor_records map[int]Acceptor
 	learner_records  Learner
-	inventoryAmounts [4]int
 
 	// LogIndex -> Mailbox of messages pertaining to a particular log slot
 	proposer_mlbx map[int]chan Message
@@ -280,7 +287,7 @@ type Server struct {
 
 // Create a new default proposer state object
 func dflProposer(site_ord int, n_peers int) *Proposer {
-	return &Proposer{MaxPropNum: site_ord + n_peers}
+	return &Proposer{MaxPropNum: 0}
 }
 
 // Create a new default acceptor state object
@@ -404,17 +411,25 @@ func dfl_inventory() [4]int {
 
 // Calculate the inventory amounts based on the filled entries
 // in the log of a stable state object. Used in recovery.
-func calc_inventory(stable_state *StableState) [4]int {
+func calc_inventory(learner_records *Learner, LogIndex int) [4]int {
 	ret := dfl_inventory()
-	for lindex := 0; lindex <= stable_state.Learner_records.HighestLogIndex; lindex++ {
-		mjr := stable_state.Learner_records.getMajority(lindex)
+	order_amts := make(map[string][4]int)
+	for lindex := 0; lindex <= LogIndex; lindex++ {
+		mjr := learner_records.getMajority(lindex)
 		if mjr != nil {
 			m := -1
+			amts := [4]int{0, 0, 0, 0}
 			if mjr.OpCode == Cancel {
 				m = 1
+				if order_amt, exists := order_amts[mjr.Name]; exists {
+					amts = order_amt
+				}
+			} else {
+				amts = mjr.Amounts
+				order_amts[mjr.Name] = mjr.Amounts
 			}
 			for i := 0; i < 4; i++ {
-				ret[i] += m * mjr.Amounts[i]
+				ret[i] += m * amts[i]
 			}
 		}
 	}
@@ -439,7 +454,6 @@ func newPaxos(numPeers int) *Paxos {
 			proposer_records: make(map[int]Proposer),
 			acceptor_records: make(map[int]Acceptor),
 			proposer_mlbx:    make(map[int]chan Message),
-			inventoryAmounts: dfl_inventory(),
 			learner_records:  *newLearner(numPeers),
 			gmtx:             sync.Mutex{}}
 	}
@@ -447,7 +461,6 @@ func newPaxos(numPeers int) *Paxos {
 		proposer_records: stable_state.Proposer_records,
 		acceptor_records: stable_state.Acceptor_records,
 		proposer_mlbx:    make(map[int]chan Message),
-		inventoryAmounts: calc_inventory(stable_state),
 		learner_records:  stable_state.Learner_records,
 		gmtx:             sync.Mutex{}}
 }
@@ -509,6 +522,8 @@ func (srv *Server) send_all(msg *Message) {
 		send_all_helper(msg, &srv.peers, acceptor_addr)
 	case AcceptedMessage:
 		send_all_helper(msg, &srv.peers, learner_addr)
+	case RecoverMessage:
+		send_all_helper(msg, &srv.peers, learner_addr)
 	default:
 		log.Fatalf("send_all: invalid message format")
 	}
@@ -528,6 +543,8 @@ func (srv *Server) send_to_id(msg *Message, site_id string) {
 		addr = proposer_addr(srv.peers[site_id])
 	case NackAcceptMessage:
 		addr = proposer_addr(srv.peers[site_id])
+	case AcceptedRelayMessage:
+		addr = learner_addr(srv.peers[site_id])
 	default:
 		log.Fatalf("send_to_id: Invalid Message Format\n")
 	}
@@ -631,14 +648,14 @@ func (srv *Server) handle_accept(LogIndex int, SenderID string,
 	// if the ProposalNumber was 0 then
 	//    the previous majority the previous majority must be known
 	//    and was proposed by the same site
-	// prevMjr := srv.px.learner_records.getMajority(LogIndex - 1)
-	// canAccept := acceptMsg.ProposalNumber >= acceptor.MaxPrepare &&
-	// 	((acceptMsg.ProposalNumber != 0) ||
-	// 		(prevMjr != nil || prevMjr.Proposer_id == SenderID))
+	prevMjr := srv.px.learner_records.getMajority(LogIndex - 1)
+	canAccept := acceptMsg.ProposalNumber >= acceptor.MaxPrepare &&
+		((acceptMsg.ProposalNumber != 0) ||
+			(prevMjr != nil || prevMjr.Proposer_id == SenderID))
 
 	// We can accept this proposed value if
 	// ProposalNumber >= MaxPrepare
-	canAccept := acceptMsg.ProposalNumber >= acceptor.MaxPrepare
+	// canAccept := acceptMsg.ProposalNumber >= acceptor.MaxPrepare
 
 	if canAccept {
 		acceptor.IsNull = false
@@ -708,56 +725,37 @@ func on_learned_str(ev *LogEvent) string {
 }
 
 // To be used with gmtx acquired
-// get the corresponding order event of a particular cancel log event that is to be added
-func (srv *Server) get_corresponding_order(ev *LogEvent) *LogEvent {
-	if ev.OpCode != Cancel {
-		log.Fatalf("get_corresponding_order: invalid OpCode\n")
-		return nil
-	}
-
-	for lindex := srv.px.learner_records.HighestLogIndex; lindex >= 0; lindex-- {
-		mjr := srv.px.learner_records.getMajority(lindex)
-		if mjr != nil && mjr.Name == ev.Name {
-			switch mjr.OpCode {
-			case Cancel:
-				return nil
-			case Order:
-				return mjr
+// check if a log event is allowed to be proposed for a particular log index.
+func (srv *Server) can_apply_log_event(ev *LogEvent, LogIndex int) bool {
+	if ev.OpCode == Cancel {
+		found := false
+		for i := 0; i < LogIndex; i += 1 {
+			mjr := srv.px.learner_records.getMajority(i)
+			if mjr == nil {
+				return false
+			}
+			if mjr.Name == ev.Name {
+				if mjr.OpCode == Cancel {
+					return false
+				}
+				found = true
 			}
 		}
-	}
-	return nil
-}
-
-// To be used with gmtx acquired
-func (srv *Server) can_apply_log_event(ev *LogEvent) bool {
-	NumHoles := srv.px.learner_records.HighestLogIndex + 1 - srv.px.learner_records.LogSize
-	if NumHoles > 0 {
-		return false
-	}
-	if ev.OpCode == Cancel {
-		return srv.get_corresponding_order(ev) != nil
+		return found
 	} else {
+		for i := 0; i < LogIndex; i += 1 {
+			mjr := srv.px.learner_records.getMajority(i)
+			if mjr == nil {
+				return false
+			}
+		}
+		inventory := calc_inventory(&srv.px.learner_records, LogIndex-1)
 		for i := 0; i < 4; i++ {
-			if ev.Amounts[i] > srv.px.inventoryAmounts[i] {
+			if ev.Amounts[i] > inventory[i] {
 				return false
 			}
 		}
 		return true
-	}
-}
-
-// To be used with gmtx acquired
-func (srv *Server) apply_log_event(ev *LogEvent) {
-	if ev.OpCode == Cancel {
-		associatedOrder := srv.get_corresponding_order(ev)
-		for i := 0; i < 4; i++ {
-			srv.px.inventoryAmounts[i] += associatedOrder.Amounts[i]
-		}
-	} else {
-		for i := 0; i < 4; i++ {
-			srv.px.inventoryAmounts[i] -= ev.Amounts[i]
-		}
 	}
 }
 
@@ -766,6 +764,7 @@ func (srv *Server) handle_accepted(LogIndex int, SenderID string,
 	acceptedMsg AcceptedMessage) {
 	srv.px.gmtx.Lock()
 
+	learned_value := false
 	// Create a default acceptor log entry for this slot, if one does not exist.
 	if _, slot_exists := srv.px.learner_records.Log[LogIndex]; !slot_exists {
 		srv.px.learner_records.Log[LogIndex] = make(map[int]map[string]LogEvent)
@@ -783,7 +782,7 @@ func (srv *Server) handle_accepted(LogIndex int, SenderID string,
 	majorityAfter := srv.px.learner_records.getMajority(LogIndex)
 	if majorityBefore == nil {
 		if majorityAfter != nil {
-			srv.apply_log_event(&acceptedMsg.AcceptVal)
+			learned_value = true
 			srv.px.learner_records.LogSize++
 			if LogIndex > srv.px.learner_records.HighestLogIndex {
 				srv.px.learner_records.HighestLogIndex = LogIndex
@@ -798,6 +797,34 @@ func (srv *Server) handle_accepted(LogIndex int, SenderID string,
 			log.Fatal("handle_accepted: learned value changed!!!")
 		}
 	}
+
+	highestLogIndex := srv.px.learner_records.HighestLogIndex
+	srv.px.gmtx.Unlock()
+
+	if learned_value {
+		srv.fill_holes(highestLogIndex)
+	}
+}
+
+func (srv *Server) handle_recover(LogIndex int, SenderID string) {
+	srv.px.gmtx.Lock()
+	if log_slot, exists := srv.px.learner_records.Log[LogIndex]; exists {
+		for accept_num, sites := range log_slot {
+			for site_id, acc_val := range sites {
+
+				acceptedRelayMsg := AcceptedRelayMessage{
+					OriginalMessage: AcceptedMessage{
+						AcceptNum: accept_num,
+						AcceptVal: acc_val},
+					OriginSite: site_id}
+				acceptedRelayMsgWrap := Message{
+					LogIndex: LogIndex,
+					SenderID: srv.site_id,
+					Contents: acceptedRelayMsg}
+				srv.send_to_id(&acceptedRelayMsgWrap, SenderID)
+			}
+		}
+	}
 	srv.px.gmtx.Unlock()
 }
 
@@ -809,6 +836,10 @@ func (srv *Server) learner_loop() {
 		switch v := msg.Contents.(type) {
 		case AcceptedMessage:
 			srv.handle_accepted(LogIndex, SenderID, v)
+		case RecoverMessage:
+			srv.handle_recover(LogIndex, SenderID)
+		case AcceptedRelayMessage:
+			srv.handle_accepted(LogIndex, v.OriginSite, v.OriginalMessage)
 		default:
 			log.Fatalf("learner_loop: invalid message format\n")
 		}
@@ -820,7 +851,7 @@ func (srv *Server) learner_loop() {
 func (srv *Server) can_skip_phase_1(LogIndex int) bool {
 	mjr := srv.px.learner_records.getMajority(LogIndex - 1)
 	return (mjr != nil && mjr.Proposer_id == srv.site_id) &&
-		srv.px.proposer_records[LogIndex].MaxPropNum == (srv.site_ord+len(srv.peers))
+		srv.px.proposer_records[LogIndex].MaxPropNum == 0
 }
 
 // proposer phase1/phase2 algorithm for synod, can run multiple
@@ -855,18 +886,18 @@ func (srv *Server) synod_attempt(propVal *LogEvent, LogIndex int) {
 		srv.px.gmtx.Lock()
 		// we can skip phase 1 if we won the last log entry and this is the
 		// site's first prepare message
-		canSkipP1 := srv.can_skip_phase_1(LogIndex)
-		prepareMsg := proposer_record.create_prepare_message()
-
-		// the proposal number to be used in the current round
-		currentRoundProposalNum := prepareMsg.ProposalNumber
+		canSkipP1 := srv.can_skip_phase_1(LogIndex) && propVal != nil
 
 		// If we can skip the prepare phase, then we use proposal number 0.
 		// This is to ensure that we cannot overwite any other site's
 		// accept message.
-		if canSkipP1 {
-			currentRoundProposalNum = 0
+		if !canSkipP1 {
+			proposer_record.MaxPropNum += len(srv.peers)
 		}
+		prepareMsg := proposer_record.create_prepare_message()
+
+		// the proposal number to be used in the current round
+		currentRoundProposalNum := prepareMsg.ProposalNumber
 
 		// This prepare message only gets sent if we aren't skipping the prepare
 		// phase (i.e. if currentRoundProposalNum =/= 0).
@@ -1046,37 +1077,82 @@ func on_unsuccessful_commit_attempt_str(ev *LogEvent) string {
 	}
 }
 
-func (srv *Server) fill_holes(LogIndex, numHoles int) {
-	if numHoles > 0 {
-		var wg sync.WaitGroup
-		wg.Add(numHoles)
-		for i := LogIndex - 1; numHoles > 0; i-- {
-			if srv.px.learner_records.getMajority(i) == nil {
-				numHoles -= 1
-				go func(lindex int) {
-					srv.synod_attempt(nil, lindex)
-					wg.Done()
-				}(i)
-			}
+// attempt to fill all holes up to but not including a certain log index
+func (srv *Server) fill_holes(LogIndex int) {
+	var wg sync.WaitGroup
+	mustWait := false
+	for i := 0; i < LogIndex; i += 1 {
+		srv.px.gmtx.Lock()
+		isEmpty := srv.px.learner_records.getMajority(i) == nil
+		srv.px.gmtx.Unlock()
+		if isEmpty {
+			mustWait = true
+			wg.Add(1)
+			go func(lindex int) {
+				srv.synod_attempt(nil, lindex)
+				wg.Done()
+			}(i)
 		}
+	}
+	if mustWait {
 		wg.Wait()
+		<-time.After(synod_timeout)
+	}
+}
+
+func (srv *Server) recover_holes(LogIndex int) {
+	var wg sync.WaitGroup
+	mustWait := false
+	for i := 0; i < LogIndex; i += 1 {
+		srv.px.gmtx.Lock()
+		isEmpty := srv.px.learner_records.getMajority(i) == nil
+		srv.px.gmtx.Unlock()
+		if isEmpty {
+			mustWait = true
+			recoverMessageWrap := Message{
+				LogIndex: i,
+				SenderID: srv.site_id,
+				Contents: RecoverMessage{}}
+			wg.Add(1)
+			go func(lindex int) {
+				srv.send_all(&recoverMessageWrap)
+			}(i)
+		}
+	}
+	if mustWait {
+		wg.Wait()
+		<-time.After(synod_timeout)
 	}
 }
 
 func (srv *Server) synod_recover() {
 	srv.px.gmtx.Lock()
 	LogIndex := srv.px.learner_records.HighestLogIndex + 1
-	numHoles := LogIndex - srv.px.learner_records.LogSize
 	srv.px.gmtx.Unlock()
 
-	srv.fill_holes(LogIndex, numHoles)
-
+	srv.fill_holes(LogIndex)
+	srv.recover_holes(LogIndex)
 	srv.synod_attempt(nil, LogIndex)
 
 	srv.px.gmtx.Lock()
 	mjr := srv.px.learner_records.getMajority(LogIndex)
+	tryRecover := mjr == nil
+	srv.px.gmtx.Unlock()
+
+	if tryRecover {
+		recoverMessageWrap := Message{
+			LogIndex: LogIndex,
+			SenderID: srv.site_id,
+			Contents: RecoverMessage{}}
+		srv.send_all(&recoverMessageWrap)
+		<-time.After(synod_timeout)
+	}
+
+	srv.px.gmtx.Lock()
+	mjr = srv.px.learner_records.getMajority(LogIndex)
 	cont := mjr != nil
 	srv.px.gmtx.Unlock()
+
 	if cont {
 		srv.synod_recover()
 	}
@@ -1085,13 +1161,12 @@ func (srv *Server) synod_recover() {
 func (srv *Server) submit_proposal(propVal *LogEvent) {
 	srv.px.gmtx.Lock()
 	LogIndex := srv.px.learner_records.HighestLogIndex + 1
-	numHoles := LogIndex - srv.px.learner_records.LogSize
 	srv.px.gmtx.Unlock()
 
-	srv.fill_holes(LogIndex, numHoles)
+	srv.fill_holes(LogIndex)
 
 	srv.px.gmtx.Lock()
-	canApply := srv.can_apply_log_event(propVal)
+	canApply := srv.can_apply_log_event(propVal, LogIndex)
 	srv.px.gmtx.Unlock()
 	if canApply {
 		// If canApply is no longer true, this would only happen
@@ -1160,9 +1235,10 @@ func (srv *Server) handle_list_orders() {
 
 // Proposer
 func (srv *Server) handle_list_inventory() {
+	inventory := calc_inventory(&srv.px.learner_records, srv.px.learner_records.HighestLogIndex)
 	for idx, val := range item_names {
 		fmt.Fprintf(os.Stdout, "%s %d\n",
-			val, srv.px.inventoryAmounts[idx])
+			val, inventory[idx])
 	}
 }
 
@@ -1324,6 +1400,11 @@ func (msg *Message) messageStr() string {
 	case NackAcceptMessage:
 		return fmt.Sprintf("nack_accept[%d](prepare_number: %d, proposal_number: %d)",
 			msg.LogIndex, v.PrepareNumber, v.ProposalNumber)
+	case RecoverMessage:
+		return fmt.Sprintf("recover[%d]", msg.LogIndex)
+	case AcceptedRelayMessage:
+		return fmt.Sprintf("accepted_relay[%d](%d, `%s`, origin_site: %s)", msg.LogIndex,
+			v.OriginalMessage.AcceptNum, v.OriginalMessage.AcceptVal.logEventStr(), v.OriginSite)
 	default:
 		log.Fatal("messageStr: Invalid Message Format")
 		return ""
@@ -1395,7 +1476,8 @@ func main() {
 	gob.Register(PromiseMessage{})
 	gob.Register(NackPrepareMessage{})
 	gob.Register(NackAcceptMessage{})
-
+	gob.Register(RecoverMessage{})
+	gob.Register(AcceptedRelayMessage{})
 	gob.Register(LogEvent{})
 
 	gob.Register(Proposer{})
