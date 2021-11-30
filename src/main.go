@@ -205,6 +205,11 @@ type AcknowledgeMessage struct {
 type RecoverMessage struct {
 }
 
+type AcceptedRelayMessage struct {
+	OriginalMessage AcceptedMessage `json:"original_message"`
+	OriginSite      string          `json:"origin_site"`
+}
+
 // Proposer state for a single LogIndex,
 // is saved to stable storage.
 type Proposer struct {
@@ -538,7 +543,7 @@ func (srv *Server) send_to_id(msg *Message, site_id string) {
 		addr = proposer_addr(srv.peers[site_id])
 	case NackAcceptMessage:
 		addr = proposer_addr(srv.peers[site_id])
-	case AcceptedMessage:
+	case AcceptedRelayMessage:
 		addr = learner_addr(srv.peers[site_id])
 	default:
 		log.Fatalf("send_to_id: Invalid Message Format\n")
@@ -807,15 +812,16 @@ func (srv *Server) handle_recover(LogIndex int, SenderID string) {
 		for accept_num, sites := range log_slot {
 			for site_id, acc_val := range sites {
 
-				acceptedMsg := AcceptedMessage{
-					AcceptNum: accept_num,
-					AcceptVal: acc_val}
-				acceptedMsgWrap := Message{
+				acceptedRelayMsg := AcceptedRelayMessage{
+					OriginalMessage: AcceptedMessage{
+						AcceptNum: accept_num,
+						AcceptVal: acc_val},
+					OriginSite: site_id}
+				acceptedRelayMsgWrap := Message{
 					LogIndex: LogIndex,
-					SenderID: site_id,
-					Contents: acceptedMsg,
-				}
-				srv.send_to_id(&acceptedMsgWrap, SenderID)
+					SenderID: srv.site_id,
+					Contents: acceptedRelayMsg}
+				srv.send_to_id(&acceptedRelayMsgWrap, SenderID)
 			}
 		}
 	}
@@ -832,6 +838,8 @@ func (srv *Server) learner_loop() {
 			srv.handle_accepted(LogIndex, SenderID, v)
 		case RecoverMessage:
 			srv.handle_recover(LogIndex, SenderID)
+		case AcceptedRelayMessage:
+			srv.handle_accepted(LogIndex, v.OriginSite, v.OriginalMessage)
 		default:
 			log.Fatalf("learner_loop: invalid message format\n")
 		}
@@ -1394,6 +1402,9 @@ func (msg *Message) messageStr() string {
 			msg.LogIndex, v.PrepareNumber, v.ProposalNumber)
 	case RecoverMessage:
 		return fmt.Sprintf("recover[%d]", msg.LogIndex)
+	case AcceptedRelayMessage:
+		return fmt.Sprintf("accepted_relay[%d](%d, `%s`, origin_site: %s)", msg.LogIndex,
+			v.OriginalMessage.AcceptNum, v.OriginalMessage.AcceptVal.logEventStr(), v.OriginSite)
 	default:
 		log.Fatal("messageStr: Invalid Message Format")
 		return ""
@@ -1466,6 +1477,7 @@ func main() {
 	gob.Register(NackPrepareMessage{})
 	gob.Register(NackAcceptMessage{})
 	gob.Register(RecoverMessage{})
+	gob.Register(AcceptedRelayMessage{})
 	gob.Register(LogEvent{})
 
 	gob.Register(Proposer{})
